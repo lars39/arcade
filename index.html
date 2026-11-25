@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Arcade</title>
+<meta name="description" content="24 free browser games. No downloads, no sign-up. Click and play.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bungee&family=Chakra+Petch:wght@400;600;700&display=swap">
+<style>
+:root{
+  --bg:#0c0a14; --bg2:#141024; --card:#1b1630; --card2:#251e42; --line:#352c5e;
+  --text:#f2eeff; --dim:#a79fcb; --hot:#ff4d6d; --sun:#ffd23f; --cool:#4dd8ff; --mint:#7bf1a8;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font-family:"Chakra Petch","Trebuchet MS",system-ui,sans-serif}
+body{min-height:100vh;background:
+  radial-gradient(1200px 500px at 15% -10%,#2a1850 0%,transparent 60%),
+  radial-gradient(900px 400px at 100% 0%,#10304a 0%,transparent 55%),var(--bg)}
+a{color:inherit}
+.wrap{max-width:1240px;margin:0 auto;padding:0 16px}
+header{padding:40px 0 18px}
+h1{font-family:"Bungee",Impact,sans-serif;font-weight:400;margin:0;font-size:clamp(38px,7vw,72px);line-height:1;letter-spacing:1px;
+  background:linear-gradient(90deg,var(--sun),var(--hot) 55%,#b46bff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.tag{color:var(--dim);font-size:17px;margin:10px 0 0}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:24px 0 8px}
+.search{flex:1 1 220px;min-width:0;background:var(--bg2);border:1px solid var(--line);color:var(--text);font:inherit;font-size:16px;
+  padding:11px 14px;border-radius:10px;outline:none}
+.search:focus{border-color:var(--cool)}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{background:var(--bg2);border:1px solid var(--line);color:var(--dim);font:inherit;font-weight:600;font-size:14px;
+  padding:8px 13px;border-radius:999px;cursor:pointer}
+.chip:hover{color:var(--text)}
+.chip[aria-pressed="true"]{background:var(--sun);border-color:var(--sun);color:#16101f}
+h2{font-family:"Bungee",Impact,sans-serif;font-weight:400;font-size:20px;margin:28px 0 12px;color:var(--text)}
+h2 small{font-family:"Chakra Petch",sans-serif;color:var(--dim);font-size:14px;margin-left:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:18px}
+.card{display:flex;flex-direction:column;background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;
+  text-decoration:none;transition:transform .15s,border-color .15s,box-shadow .15s}
+.card:hover,.card:focus-visible{transform:translateY(-3px);border-color:var(--cool);box-shadow:0 10px 30px #0008;outline:none}
+.thumb{position:relative;aspect-ratio:16/9;background:#000}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s;background:#0007}
+.play span{background:var(--sun);color:#16101f;font-family:"Bungee",sans-serif;padding:9px 18px;border-radius:8px;font-size:15px}
+.card:hover .play,.card:focus-visible .play{opacity:1}
+.badge{position:absolute;top:8px;left:8px;background:var(--hot);color:#fff;font-weight:700;font-size:12px;padding:3px 8px;border-radius:6px}
+.body{padding:12px 14px 14px}
+.title{font-family:"Bungee",sans-serif;font-size:18px;margin:0 0 3px}
+.genre{color:var(--cool);font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.desc{color:var(--dim);font-size:15px;line-height:1.4;margin:6px 0 0}
+.empty{color:var(--dim);padding:30px 0}
+footer{color:var(--dim);font-size:14px;padding:40px 0 30px;text-align:center}
+@media (max-width:560px){.grid{grid-template-columns:1fr 1fr;gap:12px}.desc{display:none}.title{font-size:15px}.body{padding:9px 10px 11px}.genre{font-size:11px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>The Arcade</h1>
+    <p class="tag">24 free games that run right in your browser. Pick one and play. Your progress saves on this device.</p>
+  </header>
+  <div class="bar">
+    <input class="search" id="q" type="search" placeholder="Search games" aria-label="Search games">
+    <div class="chips" id="chips"></div>
+  </div>
+  <section id="recentSec" hidden>
+    <h2>Keep playing</h2>
+    <div class="grid" id="recent"></div>
+  </section>
+  <section>
+    <h2 id="allHead">All games</h2>
+    <div class="grid" id="grid"></div>
+    <p class="empty" id="empty" hidden>No games match that search.</p>
+  </section>
+  <footer>Works best with a keyboard on a computer. Many games also have touch controls.</footer>
+</div>
+<script>
+const GAMES=[
+  {id:'forest-blade',t:'Forest Blade',g:'Adventure',d:'Pixel-art sword adventure. Help the old wizard drive the demons out of the forest.',n:1},
+  {id:'skyrift-brawl',t:'Skyrift Brawl',g:'Fighting',d:'20 fighters on 20 floating arenas. Knock rivals off the edge, solo, with a friend or online.',n:1},
+  {id:'nova-sentinel',t:'Nova Sentinel',g:'Shooter',d:'Hold the line against the invasion. Grab stars for multi-shot and beat both bosses.',n:1},
+  {id:'getaway-grid',t:'Getaway Grid',g:'Driving',d:'Endless city, endless sirens. Steal cars, bank cash and stay out of the cuffs.',n:1},
+  {id:'torque-crush',t:'Torque Crush',g:'Driving',d:'Monster truck on bouncy suspension. Crush robots and land flips for nitro.'},
+  {id:'ragbolt-arena',t:'Ragbolt Arena',g:'Fighting',d:'Floppy ragdoll brawling on a floating platform in a lightning storm.'},
+  {id:'hopplite',t:'Hopplite',g:'Platformer',d:'A knight on a pogo stick that never stops bouncing. Lean to steer and stomp foes.'},
+  {id:'parry-monk',t:'Parry Monk',g:'Fighting',d:'Ink-brush swordplay. Time your cuts to parry enemies from both sides.'},
+  {id:'scrap-joust',t:'Scrap Joust',g:'Driving',d:'Bumper cars with lances. Shove rivals off the plate into the scrapyard.'},
+  {id:'gale-runner',t:'Gale Runner',g:'Platformer',d:'Rooftop courier run with a living storm wall right behind you.'},
+  {id:'echo-step',t:'Echo Step',g:'Puzzle',d:'Every death leaves a stone echo. Use your own past bodies as stairs.'},
+  {id:'tether-knight',t:'Tether Knight',g:'Platformer',d:'Swing across a lava rift on a crystal chain and fling yourself forward.'},
+  {id:'shard-slicer',t:'Shard Slicer',g:'Fighting',d:'You are a living blade. Dash through enemies and chain kills in the air.'},
+  {id:'chroma-hop',t:'Chroma Hop',g:'Platformer',d:'Swap between cyan and magenta mid-air to slip through matching gates.'},
+  {id:'hushline',t:'Hushline',g:'Stealth',d:'Sneak through vaults past flashlight guards and grab all 3 data chips.'},
+  {id:'pulse-warden',t:'Pulse Warden',g:'Rhythm',d:'Strike shapes in four lanes right on the beat. Shield the red bombs.'},
+  {id:'lumen-siege',t:'Lumen Siege',g:'Shooter',d:'Build light fences with pylons to protect the core from waves of shadows.'},
+  {id:'cinderdeep',t:'Cinderdeep',g:'Adventure',d:'You are the last flame. Your health is your light as you descend the crypt.'},
+  {id:'tetherfall',t:'Tetherfall',g:'Puzzle',d:'Whip a spiked star on a rope to smash crystals with real physics.'},
+  {id:'hexfall-arena',t:'Hexfall Arena',g:'Shooter',d:'Twin-stick shooting on a hex floor that crumbles under your feet.'},
+  {id:'grazewire',t:'Grazewire',g:'Shooter',d:'Boss rush with no gun. Graze bullets to charge a lightning lance.'},
+  {id:'repulse',t:'Repulse',g:'Shooter',d:'Catch enemy bullets in your field and hurl the whole volley back.'},
+  {id:'recoilnaut',t:'Recoilnaut',g:'Shooter',d:'Zero-g arena where your gun is your engine. Aim the recoil to move.'},
+  {id:'caromancer',t:'Caromancer',g:'Shooter',d:'Bank your shots. Every ricochet doubles the damage.'}
+];
+const $=id=>document.getElementById(id);
+const genres=['All',...[...new Set(GAMES.map(x=>x.g))].sort()];
+let genre='All';
+function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null;}}
+function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function card(x){return `<a class="card" href="./${x.id}/" data-id="${x.id}">
+  <div class="thumb"><img src="thumbs/${x.id}.jpg" alt="" loading="lazy" width="640" height="360">${x.n?'<span class="badge">NEW</span>':''}<div class="play"><span>PLAY</span></div></div>
+  <div class="body"><div class="genre">${esc(x.g)}</div><p class="title">${esc(x.t)}</p><p class="desc">${esc(x.d)}</p></div></a>`;}
+function render(){
+  const q=$('q').value.trim().toLowerCase();
+  const list=GAMES.filter(x=>(genre==='All'||x.g===genre)&&(!q||(x.t+' '+x.g+' '+x.d).toLowerCase().includes(q)));
+  $('grid').innerHTML=list.map(card).join('');
+  $('empty').hidden=list.length>0;
+  $('allHead').innerHTML=(genre==='All'?'All games':esc(genre))+` <small>${list.length}</small>`;
+  let rec=[];try{rec=JSON.parse(store('arcade_recent')||'[]');}catch(e){}
+  rec=rec.map(id=>GAMES.find(x=>x.id===id)).filter(Boolean).slice(0,4);
+  $('recentSec').hidden=!rec.length||!!q||genre!=='All';
+  $('recent').innerHTML=rec.map(card).join('');
+}
+$('chips').innerHTML=genres.map(g=>`<button class="chip" aria-pressed="${g==='All'}" data-g="${g}">${g}</button>`).join('');
+$('chips').addEventListener('click',e=>{const b=e.target.closest('.chip');if(!b)return;genre=b.dataset.g;
+  document.querySelectorAll('.chip').forEach(c=>c.setAttribute('aria-pressed',c===b));render();});
+$('q').addEventListener('input',render);
+document.addEventListener('click',e=>{const a=e.target.closest('.card');if(!a)return;
+  let rec=[];try{rec=JSON.parse(store('arcade_recent')||'[]');}catch(_){}
+  rec=[a.dataset.id,...rec.filter(i=>i!==a.dataset.id)].slice(0,8);store('arcade_recent',JSON.stringify(rec));});
+window.addEventListener('pageshow',render);
+render();
+</script>
+</body>
+</html>

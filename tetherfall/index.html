@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Tetherfall</title>
+<style>
+:root{--accent:#ff4f9a;--bg:#0d0614}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);font-family:"Trebuchet MS",system-ui,sans-serif;color:#fff;
+-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:none;-webkit-tap-highlight-color:transparent}
+#c{position:absolute;display:block;image-rendering:auto}
+#ui{position:absolute;transform-origin:0 0;pointer-events:none}
+#panel{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;pointer-events:auto;
+background:radial-gradient(ellipse at center,rgba(0,0,0,.55),rgba(0,0,0,.85));text-align:center;padding:24px}
+#panel h1{font-size:64px;margin:0;letter-spacing:3px;color:var(--accent);text-shadow:0 0 24px var(--accent),0 4px 0 #000}
+#panel h2{font-size:42px;margin:0 0 6px;color:var(--accent);text-shadow:0 0 16px var(--accent)}
+#panel p{margin:0;font-size:18px;max-width:640px;line-height:1.4;opacity:.92}
+#panel .hint{font-size:16px;opacity:.8}
+#panel .tag{font-size:20px;opacity:.85;margin-bottom:10px}
+#panel button{pointer-events:auto;font:inherit;font-size:22px;font-weight:bold;padding:12px 38px;min-width:240px;border:0;border-radius:12px;cursor:pointer;
+background:var(--accent);color:#111;box-shadow:0 5px 0 rgba(0,0,0,.45),0 0 20px var(--accent);transition:transform .08s}
+#panel button:hover{transform:translateY(-2px) scale(1.03)}
+#panel button:active{transform:translateY(2px)}
+#panel button.sec{background:#333;color:#eee;box-shadow:0 5px 0 rgba(0,0,0,.45)}
+#panel .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+#panel .card{pointer-events:auto;width:210px;min-height:150px;padding:14px;border-radius:14px;background:rgba(20,20,30,.92);border:3px solid var(--accent);cursor:pointer;
+display:flex;flex-direction:column;gap:6px;transition:transform .1s}
+#panel .card:hover{transform:translateY(-4px) scale(1.04)}
+#panel .card b{font-size:20px;color:var(--accent)}
+#panel .card span{font-size:15px;opacity:.9}
+#panel .card i{font-size:34px;font-style:normal}
+#panel .stats{font-size:20px;line-height:1.6}
+.hudbtn{position:fixed;top:10px;width:44px;height:44px;border-radius:10px;border:0;background:rgba(0,0,0,.45);color:#fff;font-size:22px;cursor:pointer;z-index:5}
+#muteBtn{right:10px}#pauseBtn{right:62px;display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui"><div id="panel"></div></div>
+<button id="pauseBtn" class="hudbtn" aria-label="Pause">⏸</button>
+<button id="muteBtn" class="hudbtn" aria-label="Mute">🔊</button>
+<script>
+// ===== Shared mini-engine (inlined into each game at build time) =====
+(function () {
+  'use strict';
+  const W = 960, H = 540;
+  const E = (window.E = { W, H, t: 0, dt: 0, paused: false, state: 'title', muted: false });
+
+  // ---------- storage ----------
+  // Progress (best score, unlocks, mute) is saved in the browser's localStorage.
+  E.load = (k, d) => { try { const v = localStorage.getItem(E.id + ':' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } };
+  E.save = (k, v) => { try { localStorage.setItem(E.id + ':' + k, JSON.stringify(v)); } catch (e) {} };
+
+  // ---------- math ----------
+  E.rand = (a, b) => a + Math.random() * (b - a);
+  E.randi = (a, b) => Math.floor(E.rand(a, b + 1));
+  E.pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+  E.clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  E.lerp = (a, b, t) => a + (b - a) * t;
+  E.dist = (ax, ay, bx, by) => Math.hypot(bx - ax, by - ay);
+  E.angTo = (ax, ay, bx, by) => Math.atan2(by - ay, bx - ax);
+  E.shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+  // ---------- game-flow hooks (no platform SDK; kept so game code can call them) ----------
+  const sdk = (E.sdk = {
+    adPlaying: false,
+    gameplayStart() {}, gameplayStop() {}, happytime() {},
+    midgame(cb) { cb && cb(); },
+    rewarded(cb) { cb && cb(false, 'unavailable'); },
+  });
+
+  // ---------- canvas ----------
+  let canvas, ctx, scale = 1, offX = 0, offY = 0;
+  function resize() {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    const cw = Math.floor(W * scale), ch = Math.floor(H * scale);
+    offX = Math.floor((vw - cw) / 2); offY = Math.floor((vh - ch) / 2);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(cw * dpr); canvas.height = Math.floor(ch * dpr);
+    canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+    canvas.style.left = offX + 'px'; canvas.style.top = offY + 'px';
+    E.pxScale = (cw * dpr) / W;
+    const ui = document.getElementById('ui');
+    ui.style.left = offX + 'px'; ui.style.top = offY + 'px';
+    ui.style.width = W + 'px'; ui.style.height = H + 'px';
+    ui.style.transform = 'scale(' + scale + ')';
+  }
+
+  // ---------- input ----------
+  const keys = new Set(), pressed = new Set();
+  const inp = (E.input = { keys, pressed, mx: W / 2, my: H / 2, mdown: false, mclick: false, touch: false,
+    move: { x: 0, y: 0 }, aimX: W / 2, aimY: H / 2, fire: false, buttons: {} });
+  E.key = (k) => keys.has(k);
+  E.hit = (k) => pressed.has(k);
+  const BLOCK = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'Space'];
+  window.addEventListener('keydown', (e) => {
+    if (BLOCK.includes(e.key) || BLOCK.includes(e.code)) e.preventDefault();
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (!keys.has(k)) pressed.add(k);
+    keys.add(k); inp.touch = false; unlockAudio();
+    if ((k === 'p' || k === 'Escape') && E.state === 'play') E.togglePause();
+    if (k === 'm') E.toggleMute();
+  });
+  window.addEventListener('keyup', (e) => { const k = e.key.length === 1 ? e.key.toLowerCase() : e.key; keys.delete(k); });
+  window.addEventListener('blur', () => { keys.clear(); if (E.state === 'play' && !E.paused) E.togglePause(true); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && E.state === 'play' && !E.paused) E.togglePause(true); });
+
+  function toVirt(cx, cy) { return [(cx - offX) / scale, (cy - offY) / scale]; }
+
+  // Touch: left half = virtual joystick, right half = aim/fire, plus declared buttons.
+  E.touchButtons = []; // {id, label, x, y, r}
+  const stick = { id: null, ox: 0, oy: 0, x: 0, y: 0 };
+  const aimT = { id: null };
+  const btnT = new Map();
+  function btnAt(x, y) { for (const b of E.touchButtons) if (E.dist(x, y, b.x, b.y) < b.r * 1.15) return b; return null; }
+  function onTouch(e) {
+    if (e.target.closest && e.target.closest('#ui .panel, #ui button, .hudbtn')) return;
+    e.preventDefault(); unlockAudio(); inp.touch = true;
+    for (const t of e.changedTouches) {
+      const [x, y] = toVirt(t.clientX, t.clientY);
+      if (e.type === 'touchstart') {
+        const b = btnAt(x, y);
+        if (b) { btnT.set(t.identifier, b.id); inp.buttons[b.id] = true; pressed.add('btn:' + b.id); continue; }
+        if (!E.directTouch && x < W * 0.45 && stick.id === null) { stick.id = t.identifier; stick.ox = x; stick.oy = y; stick.x = x; stick.y = y; }
+        else if (aimT.id === null) { aimT.id = t.identifier; inp.aimX = x; inp.aimY = y; inp.fire = true; inp.mx = x; inp.my = y; inp.mclick = true; }
+      } else if (e.type === 'touchmove') {
+        if (t.identifier === stick.id) { stick.x = x; stick.y = y; }
+        if (t.identifier === aimT.id) { inp.aimX = x; inp.aimY = y; inp.mx = x; inp.my = y; }
+      } else {
+        if (btnT.has(t.identifier)) { inp.buttons[btnT.get(t.identifier)] = false; btnT.delete(t.identifier); }
+        if (t.identifier === stick.id) stick.id = null;
+        if (t.identifier === aimT.id) { aimT.id = null; inp.fire = false; }
+      }
+    }
+  }
+  E.stick = stick;
+
+  function bindPointer() {
+    canvas.addEventListener('mousemove', (e) => { const [x, y] = toVirt(e.clientX, e.clientY); inp.mx = x; inp.my = y; inp.aimX = x; inp.aimY = y; inp.touch = false; });
+    canvas.addEventListener('mousedown', (e) => { unlockAudio(); const [x, y] = toVirt(e.clientX, e.clientY); inp.mx = x; inp.my = y; if (e.button === 2) { inp.rdown = true; pressed.add('mouse2'); } else { inp.mdown = true; inp.mclick = true; } inp.touch = false; });
+    window.addEventListener('mouseup', (e) => { if (e.button === 2) inp.rdown = false; else inp.mdown = false; });
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    ['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach((ev) => canvas.addEventListener(ev, onTouch, { passive: false }));
+  }
+
+  function updateInput() {
+    let mx = 0, my = 0;
+    if (E.key('a') || E.key('ArrowLeft')) mx -= 1;
+    if (E.key('d') || E.key('ArrowRight')) mx += 1;
+    if (E.key('w') || E.key('ArrowUp')) my -= 1;
+    if (E.key('s') || E.key('ArrowDown')) my += 1;
+    if (stick.id !== null) {
+      const dx = stick.x - stick.ox, dy = stick.y - stick.oy, d = Math.hypot(dx, dy), R = 60;
+      if (d > 6) { const m = Math.min(1, d / R); mx = (dx / d) * m; my = (dy / d) * m; }
+      if (d > R) { stick.ox = stick.x - (dx / d) * R; stick.oy = stick.y - (dy / d) * R; }
+    }
+    const l = Math.hypot(mx, my); if (l > 1) { mx /= l; my /= l; }
+    inp.move.x = mx; inp.move.y = my;
+    if (!inp.touch) inp.fire = inp.mdown;
+  }
+
+  E.drawTouch = function (c) {
+    if (!inp.touch) return;
+    c.save();
+    if (stick.id !== null) {
+      c.globalAlpha = 0.25; c.fillStyle = '#fff';
+      c.beginPath(); c.arc(stick.ox, stick.oy, 60, 0, 7); c.fill();
+      c.globalAlpha = 0.5; c.beginPath(); c.arc(stick.x, stick.y, 26, 0, 7); c.fill();
+    } else if (!E.directTouch) {
+      c.globalAlpha = 0.12; c.strokeStyle = '#fff'; c.lineWidth = 3;
+      c.beginPath(); c.arc(120, H - 110, 60, 0, 7); c.stroke();
+    }
+    for (const b of E.touchButtons) {
+      c.globalAlpha = inp.buttons[b.id] ? 0.55 : 0.28; c.fillStyle = b.color || '#fff';
+      c.beginPath(); c.arc(b.x, b.y, b.r, 0, 7); c.fill();
+      c.globalAlpha = 0.9; c.fillStyle = '#000'; c.font = 'bold 16px sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+      c.fillText(b.label, b.x, b.y);
+    }
+    c.restore();
+  };
+
+  // ---------- audio (procedural) ----------
+  let AC = null, master = null, musicBus = null, sfxBus = null;
+  function unlockAudio() {
+    if (!AC) {
+      try {
+        AC = new (window.AudioContext || window.webkitAudioContext)();
+        master = AC.createGain(); master.connect(AC.destination);
+        const comp = AC.createDynamicsCompressor(); comp.connect(master);
+        sfxBus = AC.createGain(); sfxBus.gain.value = 0.5; sfxBus.connect(comp);
+        musicBus = AC.createGain(); musicBus.gain.value = 0.32; musicBus.connect(comp);
+        E.applyVolume();
+        E.onAudio && E.onAudio(AC);
+      } catch (e) { AC = null; }
+    }
+    if (AC && AC.state === 'suspended') AC.resume();
+  }
+  E.audio = () => AC; E.sfxBus = () => sfxBus; E.musicBus = () => musicBus;
+  E.unlockAudio = unlockAudio;
+  E.applyVolume = () => { if (master) master.gain.value = E.muted ? 0 : 1; };
+  E.toggleMute = () => { E.muted = !E.muted; E.save('muted', E.muted); E.applyVolume(); const b = document.getElementById('muteBtn'); if (b) b.textContent = E.muted ? '🔇' : '🔊'; };
+  let noiseBuf = null;
+  function noise() {
+    if (noiseBuf) return noiseBuf;
+    noiseBuf = AC.createBuffer(1, AC.sampleRate * 1, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    return noiseBuf;
+  }
+  // tone(freq, dur, {type, vol, slide, attack, bus, when, filter})
+  E.tone = (f, dur, o = {}) => {
+    if (!AC) return; const t0 = (o.when || AC.currentTime);
+    const osc = AC.createOscillator(), g = AC.createGain();
+    osc.type = o.type || 'square'; osc.frequency.setValueAtTime(f, t0);
+    if (o.slide) osc.frequency.exponentialRampToValueAtTime(Math.max(20, f * o.slide), t0 + dur);
+    const v = o.vol == null ? 0.3 : o.vol, a = o.attack || 0.005;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(v, t0 + a); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    let node = osc;
+    if (o.filter) { const fl = AC.createBiquadFilter(); fl.type = 'lowpass'; fl.frequency.value = o.filter; osc.connect(fl); node = fl; }
+    node.connect(g); g.connect(o.bus || sfxBus); osc.start(t0); osc.stop(t0 + dur + 0.02);
+  };
+  E.noise = (dur, o = {}) => {
+    if (!AC) return; const t0 = (o.when || AC.currentTime);
+    const s = AC.createBufferSource(); s.buffer = noise();
+    const fl = AC.createBiquadFilter(); fl.type = o.ftype || 'lowpass'; fl.frequency.setValueAtTime(o.freq || 2000, t0);
+    if (o.fslide) fl.frequency.exponentialRampToValueAtTime(Math.max(40, (o.freq || 2000) * o.fslide), t0 + dur);
+    const g = AC.createGain(), v = o.vol == null ? 0.3 : o.vol;
+    g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    s.connect(fl); fl.connect(g); g.connect(o.bus || sfxBus); s.start(t0); s.stop(t0 + dur + 0.02);
+  };
+  const lastSfx = {};
+  E.sfx = (name, p = 1) => {
+    if (!AC) return; const now = AC.currentTime;
+    if (lastSfx[name] && now - lastSfx[name] < 0.03) return; lastSfx[name] = now;
+    switch (name) {
+      case 'shoot': E.tone(880 * p, 0.08, { type: 'square', vol: 0.08, slide: 0.5 }); break;
+      case 'laser': E.tone(1400 * p, 0.12, { type: 'sawtooth', vol: 0.07, slide: 0.3 }); break;
+      case 'hit': E.tone(220 * p, 0.07, { type: 'square', vol: 0.12, slide: 0.6 }); E.noise(0.05, { freq: 3000, vol: 0.1 }); break;
+      case 'kill': E.tone(520 * p, 0.12, { type: 'triangle', vol: 0.18, slide: 0.4 }); E.noise(0.15, { freq: 1500, vol: 0.15, fslide: 0.2 }); break;
+      case 'explode': E.noise(0.45, { freq: 1200, vol: 0.4, fslide: 0.1 }); E.tone(90, 0.35, { type: 'sine', vol: 0.4, slide: 0.4 }); break;
+      case 'hurt': E.tone(160, 0.25, { type: 'sawtooth', vol: 0.2, slide: 0.5 }); E.noise(0.2, { freq: 800, vol: 0.2 }); break;
+      case 'pickup': E.tone(660 * p, 0.07, { type: 'triangle', vol: 0.15 }); E.tone(990 * p, 0.1, { type: 'triangle', vol: 0.15, when: now + 0.06 }); break;
+      case 'coin': E.tone(1320 * p, 0.06, { type: 'square', vol: 0.06 }); E.tone(1760 * p, 0.1, { type: 'square', vol: 0.06, when: now + 0.05 }); break;
+      case 'dash': E.noise(0.18, { freq: 600, ftype: 'bandpass', vol: 0.25, fslide: 4 }); break;
+      case 'select': E.tone(520, 0.06, { type: 'square', vol: 0.1 }); E.tone(780, 0.08, { type: 'square', vol: 0.1, when: now + 0.05 }); break;
+      case 'power': [0, 4, 7, 12].forEach((s, i) => E.tone(440 * Math.pow(2, s / 12), 0.15, { type: 'triangle', vol: 0.16, when: now + i * 0.07 })); break;
+      case 'lose': [0, -3, -7, -12].forEach((s, i) => E.tone(330 * Math.pow(2, s / 12), 0.3, { type: 'triangle', vol: 0.2, when: now + i * 0.15 })); break;
+      case 'win': [0, 4, 7, 12, 16].forEach((s, i) => E.tone(523 * Math.pow(2, s / 12), 0.25, { type: 'square', vol: 0.08, when: now + i * 0.08 })); break;
+      case 'blip': E.tone(1000 * p, 0.03, { type: 'sine', vol: 0.1 }); break;
+      case 'thud': E.tone(70 * p, 0.15, { type: 'sine', vol: 0.4, slide: 0.5 }); break;
+      case 'alert': E.tone(880, 0.1, { type: 'square', vol: 0.12 }); E.tone(1175, 0.15, { type: 'square', vol: 0.12, when: now + 0.1 }); break;
+    }
+  };
+
+  // ---------- juice ----------
+  let shakeAmt = 0; E.shake = (a) => { shakeAmt = Math.max(shakeAmt, a); };
+  let hitstop = 0; E.hitstop = (s) => { hitstop = Math.max(hitstop, s); };
+  let flashA = 0, flashC = '#fff'; E.flash = (c, a = 0.4) => { flashC = c; flashA = a; };
+  const parts = (E.parts = []);
+  E.burst = (x, y, color, n = 12, spd = 200, life = 0.5, size = 3, o = {}) => {
+    for (let i = 0; i < n && parts.length < 1200; i++) {
+      const a = o.ang != null ? o.ang + E.rand(-(o.spread || 0.5), o.spread || 0.5) : Math.random() * 6.283;
+      const s = spd * E.rand(0.3, 1);
+      parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: life * E.rand(0.6, 1), max: life, size: size * E.rand(0.6, 1.3), color, drag: o.drag == null ? 3 : o.drag, g: o.g || 0, glow: o.glow });
+    }
+  };
+  const texts = (E.texts = []);
+  E.popText = (x, y, str, color = '#fff', size = 18) => texts.push({ x, y, str, color, size, life: 0.9 });
+  function updateFx(dt) {
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i]; p.life -= dt; if (p.life <= 0) { parts.splice(i, 1); continue; }
+      const k = Math.exp(-p.drag * dt); p.vx *= k; p.vy *= k; p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    }
+    for (let i = texts.length - 1; i >= 0; i--) { const t = texts[i]; t.life -= dt; t.y -= 40 * dt; if (t.life <= 0) texts.splice(i, 1); }
+    shakeAmt *= Math.exp(-10 * dt); if (shakeAmt < 0.3) shakeAmt = 0;
+    flashA *= Math.exp(-8 * dt);
+  }
+  E.drawParts = (c) => {
+    c.save(); c.globalCompositeOperation = 'lighter';
+    for (const p of parts) { c.globalAlpha = Math.max(0, p.life / p.max); c.fillStyle = p.color; const s = p.size; c.fillRect(p.x - s / 2, p.y - s / 2, s, s); }
+    c.restore();
+  };
+  E.drawTexts = (c) => {
+    c.save(); c.textAlign = 'center';
+    for (const t of texts) { c.globalAlpha = Math.min(1, t.life * 2); c.font = 'bold ' + t.size + 'px "Trebuchet MS", sans-serif'; c.fillStyle = '#000'; c.fillText(t.str, t.x + 2, t.y + 2); c.fillStyle = t.color; c.fillText(t.str, t.x, t.y); }
+    c.restore();
+  };
+
+  // ---------- UI overlay ----------
+  E.ui = (html) => { const p = document.getElementById('panel'); if (html == null) { p.style.display = 'none'; p.innerHTML = ''; return p; } p.innerHTML = html; p.style.display = 'flex'; return p; };
+  E.on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', (e) => { e.stopPropagation(); unlockAudio(); E.sfx('select'); fn(e); }); };
+  E.togglePause = (auto) => {
+    if (E.state !== 'play') return;
+    E.paused = !E.paused;
+    if (E.paused) {
+      if (auto !== true) sdk.gameplayStop();
+      E.ui('<h2>Paused</h2><button id="bResume">Resume</button><button id="bQuit" class="sec">Quit to Title</button><p class="hint">P / Esc to resume · M to mute</p>');
+      E.on('bResume', E.togglePause);
+      E.on('bQuit', () => { E.paused = false; E.ui(null); E.game.toTitle(); });
+    } else { E.ui(null); sdk.gameplayStart(); }
+  };
+
+  // ---------- main loop ----------
+  let last = 0;
+  function frame(ts) {
+    requestAnimationFrame(frame);
+    let dt = Math.min(0.033, (ts - last) / 1000 || 0); last = ts;
+    updateInput();
+    if (sdk.adPlaying) dt = 0;
+    const g = E.game;
+    if (hitstop > 0) { hitstop -= dt; dt *= 0.05; }
+    if (!E.paused && !sdk.adPlaying) { E.t += dt; E.dt = dt; g.update(dt); updateFx(dt); }
+    ctx.setTransform(E.pxScale, 0, 0, E.pxScale, 0, 0);
+    ctx.save();
+    if (shakeAmt > 0) ctx.translate(E.rand(-shakeAmt, shakeAmt), E.rand(-shakeAmt, shakeAmt));
+    g.draw(ctx);
+    ctx.restore();
+    if (g.drawHud) g.drawHud(ctx);
+    if (E.state === 'play') E.drawTouch(ctx);
+    if (flashA > 0.01) { ctx.globalAlpha = flashA; ctx.fillStyle = flashC; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+    pressed.clear(); inp.mclick = false;
+  }
+
+  E.start = async (game) => {
+    E.game = game; E.id = game.id;
+    canvas = document.getElementById('c'); ctx = canvas.getContext('2d'); E.ctx = ctx; E.canvas = canvas;
+    E.muted = E.load('muted', false);
+    const mb = document.getElementById('muteBtn'); mb.textContent = E.muted ? '🔇' : '🔊';
+    mb.addEventListener('click', (e) => { e.stopPropagation(); unlockAudio(); E.toggleMute(); });
+    const pb = document.getElementById('pauseBtn');
+    pb.addEventListener('click', (e) => { e.stopPropagation(); E.togglePause(); });
+    window.addEventListener('resize', resize); resize(); bindPointer();
+    E.muted = E.load('muted', false); mb.textContent = E.muted ? '🔇' : '🔊'; E.applyVolume();
+    game.init && game.init();
+    game.toTitle();
+    requestAnimationFrame(frame);
+  };
+  E.setState = (s) => { E.state = s; document.getElementById('pauseBtn').style.display = s === 'play' ? 'block' : 'none'; if (s === 'play') sdk.gameplayStart(); else sdk.gameplayStop(); };
+
+  // helpers for drawing
+  E.glow = (c, color, blur) => { c.shadowColor = color; c.shadowBlur = blur; };
+  E.noGlow = (c) => { c.shadowBlur = 0; };
+  E.bar = (c, x, y, w, h, frac, fg, bg = 'rgba(0,0,0,.5)') => { c.fillStyle = bg; c.fillRect(x, y, w, h); c.fillStyle = fg; c.fillRect(x, y, w * E.clamp(frac, 0, 1), h); };
+  E.text = (c, str, x, y, size = 20, color = '#fff', align = 'left', font = '"Trebuchet MS", sans-serif') => {
+    size = Math.max(size, 13); // stays readable on small screens
+    c.font = 'bold ' + size + 'px ' + font; c.textAlign = align; c.textBaseline = 'alphabetic';
+    c.fillStyle = 'rgba(0,0,0,.6)'; c.fillText(str, x + 2, y + 2); c.fillStyle = color; c.fillText(str, x, y);
+  };
+})();
+
+</script>
+<script>
+// TETHERFALL — action-puzzle. Steer a tiny anchor; a heavy star-flail swings on its tether. Smash every crystal.
+(function () {
+  const { W, H } = E;
+  const G = { id: 'tetherfall' };
+  const T = 40, OY = 20, COLS = 24, ROWS = 13;
+  E.directTouch = true;
+
+  const LEVELS = [
+    { n: 'First Swing', par: 14, hint: 'Move your anchor (mouse or WASD). The star swings behind you — smash crystals with it!', m: [
+      '########################', '#......................#', '#......................#', '#...c..............c...#', '#......................#', '#......................#', '#..........P...........#', '#......................#', '#......................#', '#...c..............c...#', '#......................#', '#......................#', '########################'] },
+    { n: 'Heavy Hearts', par: 20, hint: 'Gold crystals need a FAST hit. Hold click / Space to reel in and whip the star!', m: [
+      '########################', '#......................#', '#..c.......H........c..#', '#......................#', '#......####.####.......#', '#......#.......#.......#', '#......#...P...#.......#', '#......#.......#.......#', '#......#########.......#', '#......................#', '#..c................H..#', '#......................#', '########################'] },
+    { n: 'Sentries', par: 24, hint: 'Sentries shoot your anchor. Smash them with the star.', m: [
+      '########################', '#e....................e#', '#......................#', '#....c.....#.....c.....#', '#..........#...........#', '#..........#...........#', '#....###...P...###.....#', '#..........#...........#', '#..........#...........#', '#....c.....#.....c.....#', '#......................#', '#e....................e#', '########################'] },
+    { n: 'Gatekeeper', par: 32, hint: 'Hit a switch with the star to flip every gate. Plan your route!', m: [
+      '########################', '#..........#...........#', '#..c.......G.......c...#', '#..........#...........#', '#..........#...........#', '#####G######...........#', '#..........#.....S.....#', '#..P.......#...........#', '#..........#...........#', '#....S.....###g#########', '#..........#...........#', '#..c.......#.......H...#', '########################'] },
+    { n: 'Mine Field', par: 26, hint: 'Spikes hurt your anchor but not the star. Mines can be smashed.', m: [
+      '########################', '#......................#', '#..c...m.........m..c..#', '#......................#', '#^^^^^^^^^......^^^^^^^#', '#......................#', '#.....P.........H......#', '#......................#', '#^^^^^^^......^^^^^^^^^#', '#......................#', '#..c.....m.......m..c..#', '#......................#', '########################'] },
+    { n: 'The Vault', par: 30, hint: 'Thread the star through narrow gaps.', m: [
+      '########################', '#......................#', '#.e..................e.#', '#......#####.####......#', '#......#........#......#', '#..c...#...HH...#...c..#', '#......#........#......#', '#......####.#####......#', '#......................#', '#..........P...........#', '#.e.....c......c.....e.#', '#......................#', '########################'] },
+    { n: 'Switchback', par: 45, hint: 'Gates can lock behind you. Press R to restart if stuck.', m: [
+      '########################', '#P.....#.......#.....c.#', '#......#.......#.......#', '#......G...c...g.......#', '#......#.......#.......#', '####.###########G#######', '#......................#', '#..S...m........m...S..#', '#......................#', '#^^^^^^^^^^G^^^^^^^^^^^#', '#......................#', '#...H.......c.......H..#', '########################'] },
+    { n: 'Crossfire', par: 34, hint: 'Clear the sentries first, then go for the vault.', m: [
+      '########################', '#e........e...........e#', '#......................#', '#...c....#####....c....#', '#........#...#.........#', '#..##....#.H.#....##...#', '#........#...#.........#', '#...P....##.##.........#', '#......................#', '#...c..m.........m.c...#', '#......................#', '#e.........e..........e#', '########################'] },
+    { n: 'Pendulum Hall', par: 34, hint: 'Swing the star over spike walls to reach crystals behind them.', m: [
+      '########################', '#.....^......^.....H...#', '#..c..^..c...^..c..^...#', '#.....^......^.....^...#', '#.....^......^.....^...#', '#.....^......^.....^...#', '#......................#', '#.P....................#', '#......................#', '#.....^^^^.......^^^^..#', '#..H..^..^...c...^..^..#', '#.....^..^.......^..^..#', '########################'] },
+    { n: 'Heart of the Lock', par: 50, hint: 'The final lock. Everything you learned.', m: [
+      '########################', '#e.........S..........e#', '#......................#', '#..#######G#G#######...#', '#..#...............#...#', '#..G...m.......m...G...#', '#..#.....HcccH.....#...#', '#..#...............#...#', '#..#######g#g#######...#', '#..........P...........#', '#..^^^^^^......^^^^^^..#', '#e.........S..........e#', '########################'] },
+  ];
+
+  let lvl, grid, A, F, crystals, foes, bullets, switches, gates, hp, time, done, stars, unlocked, completedCount, hintT, reelT, trail, tlen;
+
+  G.init = () => {
+    stars = E.load('stars', {}); unlocked = E.load('unlocked', 1); completedCount = 0;
+    E.touchButtons = [{ id: 'reel', label: 'REEL', x: W - 80, y: H - 80, r: 50, color: '#ff4f9a' }];
+    load(0, true);
+  };
+
+  function load(i, demo) {
+    lvl = i; const L = LEVELS[i];
+    grid = []; crystals = []; foes = []; bullets = []; switches = []; gates = []; trail = [];
+    for (let r = 0; r < ROWS; r++) {
+      grid.push([]);
+      for (let c = 0; c < COLS; c++) {
+        const ch = L.m[r][c], x = c * T + T / 2, y = r * T + T / 2 + OY;
+        let cell = ch === '#' ? 1 : ch === '^' ? 2 : 0;
+        if (ch === 'P') A = { x, y, vx: 0, vy: 0, r: 9, inv: 0 };
+        if (ch === 'c' || ch === 'H') crystals.push({ x, y, r: 13, heavy: ch === 'H', t: Math.random() * 6, hit: 0 });
+        if (ch === 'e') foes.push({ type: 'turret', x, y, r: 13, cd: E.rand(1, 2.5), t: 0 });
+        if (ch === 'm') foes.push({ type: 'mine', x, y, r: 11, dir: 1, t: 0 });
+        if (ch === 'S') switches.push({ x, y, r: 13, cd: 0 });
+        if (ch === 'G' || ch === 'g') { gates.push({ c, r, open: ch === 'g', a: ch === 'g' ? 0 : 1 }); }
+        grid[r].push(cell);
+      }
+    }
+    tlen = 100;
+    F = { x: A.x + tlen, y: A.y, vx: 0, vy: 0, r: 14 };
+    hp = 3; time = 0; done = false; hintT = demo ? 0 : 6; reelT = 0;
+  }
+
+  function solidAt(c, r) {
+    if (c < 0 || r < 0 || c >= COLS || r >= ROWS) return true;
+    if (grid[r][c] === 1) return true;
+    for (const g of gates) if (g.c === c && g.r === r && !g.open) return true;
+    return false;
+  }
+  // circle vs tiles; returns collision normal if any
+  function collide(o, bounce) {
+    let hitN = null;
+    const c0 = Math.floor((o.x - o.r) / T), c1 = Math.floor((o.x + o.r) / T), r0 = Math.floor((o.y - OY - o.r) / T), r1 = Math.floor((o.y - OY + o.r) / T);
+    for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+      if (!solidAt(c, r)) continue;
+      const rx = c * T, ry = r * T + OY;
+      const cx = E.clamp(o.x, rx, rx + T), cy = E.clamp(o.y, ry, ry + T);
+      const dx = o.x - cx, dy = o.y - cy, d = Math.hypot(dx, dy);
+      if (d < o.r && d > 0) {
+        const nx = dx / d, ny = dy / d; o.x = cx + nx * o.r; o.y = cy + ny * o.r;
+        const vn = o.vx * nx + o.vy * ny;
+        if (vn < 0) { o.vx -= (1 + bounce) * vn * nx; o.vy -= (1 + bounce) * vn * ny; hitN = { nx, ny, vn }; }
+      } else if (d === 0) { o.y -= 1; }
+    }
+    return hitN;
+  }
+
+  G.toTitle = () => {
+    E.setState('title'); load(0, true);
+    E.ui(`<h1>TETHERFALL</h1><div class="tag">A tiny anchor. A heavy star. Swing it. Smash everything.</div>
+      <button id="bPlay">${unlocked > 1 ? 'Continue' : 'Play'}</button><button id="bSel" class="sec">Level Select</button>
+      <p class="hint">Move: Mouse / WASD / Drag · Reel in (whip!): Hold Click / Space / REEL button · Restart: R</p>`);
+    E.on('bPlay', () => startLevel(Math.min(unlocked, LEVELS.length) - 1));
+    E.on('bSel', levelSelect);
+  };
+
+  function levelSelect() {
+    const cells = LEVELS.map((L, i) => {
+      const s = stars[i] || 0, lock = i >= unlocked;
+      return `<div class="card" id="lv${i}" style="width:150px;min-height:96px;${lock ? 'opacity:.35' : ''}"><b>${i + 1}. ${L.n}</b><span style="font-size:22px">${lock ? '🔒' : '★'.repeat(s) + '☆'.repeat(3 - s)}</span></div>`;
+    }).join('');
+    E.ui(`<h2>Select Level</h2><div class="row" style="max-width:860px">${cells}</div><button id="bBack" class="sec">Back</button>`);
+    LEVELS.forEach((L, i) => { if (i < unlocked) E.on('lv' + i, () => startLevel(i)); });
+    E.on('bBack', G.toTitle);
+  }
+
+  function startLevel(i) { E.ui(null); load(i, false); E.setState('play'); E.sfx('select'); }
+
+  function hurt() {
+    if (A.inv > 0 || done) return;
+    hp--; A.inv = 1.2; E.sfx('hurt'); E.shake(8); E.flash('#ff1744', 0.25); E.burst(A.x, A.y, '#ff80ab', 20, 220, 0.5, 3);
+    if (hp <= 0) fail();
+  }
+  function fail() {
+    done = true; E.sfx('lose'); E.setState('over');
+    setTimeout(() => E.sdk.midgame(() => {
+      E.ui(`<h2>Anchor broken</h2><p>${LEVELS[lvl].n}</p><button id="bRetry">Retry</button><button id="bSel" class="sec">Levels</button>`);
+      E.on('bRetry', () => startLevel(lvl)); E.on('bSel', levelSelect);
+    }), 700);
+  }
+  function win() {
+    done = true; E.sfx('win'); E.flash('#fff', 0.3); E.sdk.happytime();
+    const par = LEVELS[lvl].par, s = time <= par ? 3 : time <= par * 1.6 ? 2 : 1;
+    if ((stars[lvl] || 0) < s) { stars[lvl] = s; E.save('stars', stars); }
+    if (lvl + 2 > unlocked) { unlocked = Math.min(LEVELS.length, lvl + 2); E.save('unlocked', unlocked); }
+    completedCount++;
+    E.setState('menu');
+    const show = () => {
+      const last = lvl === LEVELS.length - 1;
+      const total = Object.values(stars).reduce((a, b) => a + b, 0);
+      E.ui(`<h2>${last ? 'All locks broken!' : 'Level clear!'}</h2><div style="font-size:54px;color:#ffd740;text-shadow:0 0 20px #ffab00">${'★'.repeat(s)}${'☆'.repeat(3 - s)}</div>
+        <div class="stats">Time ${time.toFixed(1)}s · Par ${par}s${last ? `<br>Total stars: ${total}/${LEVELS.length * 3}` : ''}</div>
+        ${last ? '' : '<button id="bNext">Next Level</button>'}<button id="bRetry" class="sec">Replay</button><button id="bSel" class="sec">Levels</button>`);
+      if (!last) E.on('bNext', () => startLevel(lvl + 1));
+      E.on('bRetry', () => startLevel(lvl)); E.on('bSel', levelSelect);
+    };
+    setTimeout(() => (completedCount % 3 === 0 ? E.sdk.midgame(show) : show()), 900);
+  }
+
+  let mouseMode = true, lastMx = 0, lastMy = 0;
+  G.update = (dt) => {
+    for (const c of crystals) c.t += dt;
+    for (const g of gates) g.a = E.lerp(g.a, g.open ? 0 : 1, dt * 12);
+    if (E.state === 'title') { // demo: anchor circles
+      A.x = W / 2 + Math.cos(E.t * 1.5) * 160; A.y = H / 2 + 40 + Math.sin(E.t * 3) * 60; physics(dt, false); return;
+    }
+    if (E.state !== 'play') { if (E.state === 'over' || E.state === 'menu') physics(dt, false); return; }
+    if (E.hit('r')) return startLevel(lvl);
+    time += dt; hintT -= dt; A.inv -= dt;
+    // input
+    const m = E.input.move, inp = E.input;
+    if (Math.abs(inp.mx - lastMx) + Math.abs(inp.my - lastMy) > 2) mouseMode = true;
+    lastMx = inp.mx; lastMy = inp.my;
+    if (m.x || m.y) mouseMode = false;
+    const MAXS = 330;
+    let tvx, tvy;
+    if (!mouseMode || (inp.touch && !inp.fire && !(m.x || m.y))) {
+      if (inp.touch && !inp.fire) { tvx = 0; tvy = 0; } else { tvx = m.x * MAXS; tvy = m.y * MAXS; }
+    } else {
+      const dx = inp.aimX - A.x, dy = inp.aimY - A.y, d = Math.hypot(dx, dy);
+      const s = Math.min(MAXS, d * 8); tvx = d > 1 ? (dx / d) * s : 0; tvy = d > 1 ? (dy / d) * s : 0;
+    }
+    A.vx = E.lerp(A.vx, tvx, Math.min(1, dt * 14)); A.vy = E.lerp(A.vy, tvy, Math.min(1, dt * 14));
+    A.x += A.vx * dt; A.y += A.vy * dt; collide(A, 0);
+    const reel = E.key(' ') || inp.rdown || inp.buttons.reel || (!inp.touch && inp.mdown);
+    tlen = E.lerp(tlen, reel ? 48 : 104, dt * (reel ? 9 : 4));
+    if (reel) reelT += dt; else reelT = 0;
+    physics(dt, true);
+
+    // hazards
+    const ac = Math.floor(A.x / T), ar = Math.floor((A.y - OY) / T);
+    if (grid[ar] && grid[ar][ac] === 2) hurt();
+    // foes
+    for (const f of foes) {
+      if (f.dead) continue; f.t += dt;
+      if (f.type === 'turret') {
+        f.cd -= dt;
+        if (f.cd <= 0 && E.dist(f.x, f.y, A.x, A.y) < 520) { f.cd = 2.2; const a = E.angTo(f.x, f.y, A.x, A.y); bullets.push({ x: f.x, y: f.y, vx: Math.cos(a) * 170, vy: Math.sin(a) * 170, r: 5 }); E.sfx('laser', 0.7); }
+      } else if (f.type === 'mine') {
+        const nx = f.x + f.dir * 90 * dt, c = Math.floor((nx + f.dir * f.r) / T), r = Math.floor((f.y - OY) / T);
+        if (solidAt(c, r) || grid[r][c] === 2) f.dir *= -1; else f.x = nx;
+        if (E.dist(f.x, f.y, A.x, A.y) < f.r + A.r) hurt();
+      }
+    }
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i]; b.x += b.vx * dt; b.y += b.vy * dt;
+      if (solidAt(Math.floor(b.x / T), Math.floor((b.y - OY) / T))) { E.burst(b.x, b.y, '#ff8a65', 5, 90, 0.2, 2); bullets.splice(i, 1); continue; }
+      if (E.dist(b.x, b.y, F.x, F.y) < F.r + b.r) { E.burst(b.x, b.y, '#ffd180', 8, 140, 0.25, 2); E.sfx('blip'); bullets.splice(i, 1); continue; }
+      if (E.dist(b.x, b.y, A.x, A.y) < A.r + b.r) { hurt(); bullets.splice(i, 1); }
+    }
+    if (!done && crystals.length === 0) win();
+  };
+
+  function physics(dt, live) {
+    // sub-stepped rope physics for the star
+    const steps = 4, h = dt / steps;
+    for (let s = 0; s < steps; s++) {
+      F.vy += 0; // top-down: no gravity
+      const dx = F.x - A.x, dy = F.y - A.y, d = Math.hypot(dx, dy) || 1;
+      if (d > tlen) { // taut rope: spring + remove outward velocity
+        const nx = dx / d, ny = dy / d, ext = d - tlen;
+        F.vx -= nx * ext * 60 * h; F.vy -= ny * ext * 60 * h;
+        const vr = (F.vx - A.vx) * nx + (F.vy - A.vy) * ny; if (vr > 0) { F.vx -= nx * vr * 0.5; F.vy -= ny * vr * 0.5; }
+      }
+      const damp = Math.exp(-0.5 * h); F.vx *= damp; F.vy *= damp;
+      F.x += F.vx * h; F.y += F.vy * h;
+      const n = collide(F, 0.55);
+      if (n && live && -n.vn > 140) { E.sfx('thud', 1 + Math.min(1, -n.vn / 600)); E.shake(Math.min(6, -n.vn / 120)); E.burst(F.x - n.nx * F.r, F.y - n.ny * F.r, '#ffe0f0', 6, 150, 0.3, 2); }
+    }
+    const spd = Math.hypot(F.vx, F.vy);
+    trail.push({ x: F.x, y: F.y, s: spd }); if (trail.length > 14) trail.shift();
+    if (!live) return;
+    // star hits
+    for (let i = crystals.length - 1; i >= 0; i--) {
+      const c = crystals[i]; if (E.dist(F.x, F.y, c.x, c.y) > F.r + c.r) continue;
+      const need = c.heavy ? 560 : 260;
+      if (spd >= need) {
+        crystals.splice(i, 1); E.sfx('explode'); E.sfx('kill', c.heavy ? 0.7 : 1.3); E.shake(c.heavy ? 12 : 6); E.hitstop(c.heavy ? 0.08 : 0.04);
+        E.burst(c.x, c.y, c.heavy ? '#ffd740' : '#80d8ff', 34, 380, 0.7, 4); E.popText(c.x, c.y - 20, c.heavy ? 'SHATTER!' : 'SMASH', c.heavy ? '#ffd740' : '#80d8ff', 18);
+      } else if (c.hit <= 0) {
+        c.hit = 0.3; E.sfx('blip', 2); const a = E.angTo(c.x, c.y, F.x, F.y); F.vx = Math.cos(a) * 160; F.vy = Math.sin(a) * 160;
+        E.popText(c.x, c.y - 20, 'Faster!', '#ff80ab', 14);
+      }
+    }
+    for (const c of crystals) c.hit -= dt;
+    for (const f of foes) {
+      if (f.dead || E.dist(F.x, F.y, f.x, f.y) > F.r + f.r) continue;
+      if (spd >= 220) { f.dead = true; E.sfx('explode'); E.shake(8); E.burst(f.x, f.y, f.type === 'mine' ? '#ff5252' : '#ff8a65', 30, 300, 0.6, 4); E.popText(f.x, f.y - 20, 'WRECKED', '#ff8a65', 16); }
+    }
+    for (const sw of switches) {
+      sw.cd -= dt;
+      if (sw.cd <= 0 && E.dist(F.x, F.y, sw.x, sw.y) < F.r + sw.r && spd > 120) {
+        sw.cd = 0.6; for (const g of gates) g.open = !g.open; E.sfx('power'); E.shake(4); E.burst(sw.x, sw.y, '#69f0ae', 20, 200, 0.4, 3);
+        for (const g of gates) if (!g.open) { const gx = g.c * T + T / 2, gy = g.r * T + T / 2 + OY; if (E.dist(A.x, A.y, gx, gy) < 30) { A.x += 1; } }
+      }
+    }
+  }
+
+  // ---------- draw ----------
+  G.draw = (c) => {
+    c.fillStyle = '#160b1f'; c.fillRect(0, 0, W, H);
+    for (let r = 0; r < ROWS; r++) for (let cc = 0; cc < COLS; cc++) {
+      const x = cc * T, y = r * T + OY, v = grid[r][cc];
+      if (v === 1) { c.fillStyle = '#3a1f4d'; c.fillRect(x, y, T, T); c.fillStyle = '#56306f'; c.fillRect(x, y, T, 5); c.fillStyle = '#26133a'; c.fillRect(x, y + T - 4, T, 4); }
+      else { c.fillStyle = (r + cc) % 2 ? '#1d1029' : '#21122e'; c.fillRect(x, y, T, T); }
+      if (v === 2) { c.fillStyle = '#ff1744'; for (let k = 0; k < 3; k++) { c.beginPath(); c.moveTo(x + 4 + k * 12, y + 34); c.lineTo(x + 10 + k * 12, y + 8); c.lineTo(x + 16 + k * 12, y + 34); c.fill(); } }
+    }
+    for (const g of gates) {
+      const x = g.c * T, y = g.r * T + OY;
+      c.strokeStyle = 'rgba(105,240,174,.35)'; c.strokeRect(x + 2, y + 2, T - 4, T - 4);
+      if (g.a > 0.05) { c.globalAlpha = g.a; c.fillStyle = '#00e676'; E.glow(c, '#00e676', 12); for (let k = 0; k < 4; k++) c.fillRect(x + 4 + k * 9, y + 2, 5, T - 4); E.noGlow(c); c.globalAlpha = 1; }
+    }
+    for (const sw of switches) { c.fillStyle = sw.cd > 0 ? '#b9f6ca' : '#00c853'; E.glow(c, '#69f0ae', 14); c.beginPath(); c.arc(sw.x, sw.y, sw.r, 0, 7); c.fill(); E.noGlow(c); c.fillStyle = '#003d1a'; c.font = 'bold 14px sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.fillText('⇄', sw.x, sw.y + 1); }
+    for (const k of crystals) {
+      c.save(); c.translate(k.x, k.y + Math.sin(k.t * 2) * 2); c.rotate(Math.sin(k.t) * 0.1);
+      const col = k.heavy ? '#ffd740' : '#80d8ff'; E.glow(c, col, 18); c.fillStyle = k.hit > 0 ? '#fff' : col;
+      c.beginPath(); c.moveTo(0, -16); c.lineTo(11, -2); c.lineTo(6, 14); c.lineTo(-6, 14); c.lineTo(-11, -2); c.closePath(); c.fill(); E.noGlow(c);
+      c.fillStyle = 'rgba(255,255,255,.6)'; c.beginPath(); c.moveTo(0, -12); c.lineTo(5, -2); c.lineTo(0, 8); c.closePath(); c.fill();
+      if (k.heavy) { c.strokeStyle = '#ff6f00'; c.lineWidth = 2; c.stroke(); }
+      c.restore();
+    }
+    for (const f of foes) {
+      if (f.dead) continue;
+      c.save(); c.translate(f.x, f.y);
+      if (f.type === 'turret') { c.fillStyle = '#4e342e'; c.beginPath(); c.arc(0, 0, 15, 0, 7); c.fill(); c.rotate(E.angTo(f.x, f.y, A.x, A.y)); c.fillStyle = '#ff7043'; c.fillRect(0, -4, 18, 8); c.beginPath(); c.arc(0, 0, 9, 0, 7); c.fill(); c.fillStyle = f.cd < 0.5 ? '#fff' : '#ffccbc'; c.beginPath(); c.arc(0, 0, 4, 0, 7); c.fill(); }
+      else { c.rotate(f.t * 4); c.fillStyle = '#ff5252'; E.glow(c, '#ff1744', 10); for (let k = 0; k < 8; k++) { c.rotate(Math.PI / 4); c.fillRect(-2, -15, 4, 8); } c.beginPath(); c.arc(0, 0, 9, 0, 7); c.fill(); E.noGlow(c); }
+      c.restore();
+    }
+    for (const b of bullets) { c.fillStyle = '#ff9e80'; E.glow(c, '#ff3d00', 10); c.beginPath(); c.arc(b.x, b.y, b.r, 0, 7); c.fill(); E.noGlow(c); }
+    // tether
+    const taut = E.dist(A.x, A.y, F.x, F.y) >= tlen * 0.98;
+    c.strokeStyle = taut ? '#ffb3d1' : 'rgba(255,179,209,.6)'; c.lineWidth = taut ? 3 : 2;
+    c.beginPath(); c.moveTo(A.x, A.y);
+    if (!taut) { const mx = (A.x + F.x) / 2, my = (A.y + F.y) / 2 + 10; c.quadraticCurveTo(mx, my, F.x, F.y); } else c.lineTo(F.x, F.y);
+    c.stroke();
+    // trail
+    c.save(); c.globalCompositeOperation = 'lighter';
+    trail.forEach((p, i) => { const k = i / trail.length; const fast = p.s > 560 ? '#ffd740' : p.s > 260 ? '#ff4f9a' : '#7b5a8a'; c.globalAlpha = k * 0.5; c.fillStyle = fast; c.beginPath(); c.arc(p.x, p.y, F.r * k, 0, 7); c.fill(); });
+    c.restore();
+    // star
+    const spd = Math.hypot(F.vx, F.vy), sc = spd > 560 ? '#ffd740' : spd > 260 ? '#ff4f9a' : '#ce93d8';
+    c.save(); c.translate(F.x, F.y); c.rotate(E.t * (2 + spd / 60)); E.glow(c, sc, spd > 260 ? 22 : 8); c.fillStyle = sc;
+    c.beginPath(); for (let i = 0; i < 10; i++) { const a = (i / 10) * 6.283, r = i % 2 ? 7 : F.r + 3; c.lineTo(Math.cos(a) * r, Math.sin(a) * r); } c.closePath(); c.fill(); E.noGlow(c);
+    c.fillStyle = '#fff'; c.beginPath(); c.arc(0, 0, 4, 0, 7); c.fill(); c.restore();
+    // anchor
+    if (!(A.inv > 0 && Math.floor(A.inv * 16) % 2)) {
+      c.fillStyle = '#ffffff'; E.glow(c, '#ff4f9a', 14); c.beginPath(); c.arc(A.x, A.y, A.r, 0, 7); c.fill(); E.noGlow(c);
+      c.strokeStyle = '#ff4f9a'; c.lineWidth = 3; c.beginPath(); c.arc(A.x, A.y, A.r - 3, 0, 7); c.stroke();
+    }
+    E.drawParts(c); E.drawTexts(c);
+  };
+
+  G.drawHud = (c) => {
+    if (E.state === 'title') return;
+    c.fillStyle = 'rgba(0,0,0,.55)'; c.fillRect(0, 0, W, OY);
+    E.text(c, (lvl + 1) + '. ' + LEVELS[lvl].n, 8, 16, 14, '#ff9ccc');
+    E.text(c, '❤'.repeat(Math.max(0, hp)) + '♡'.repeat(Math.max(0, 3 - hp)), 280, 16, 14, '#ff4f9a');
+    E.text(c, '◆ ' + crystals.length + ' left', 380, 16, 14, '#80d8ff');
+    E.text(c, time.toFixed(1) + 's / par ' + LEVELS[lvl].par + 's', 520, 16, 14, time <= LEVELS[lvl].par ? '#b9f6ca' : '#ffab91');
+    const spd = Math.hypot(F.vx, F.vy); E.bar(c, 720, 6, 110, 8, spd / 700, spd > 560 ? '#ffd740' : spd > 260 ? '#ff4f9a' : '#9575cd');
+    c.fillStyle = '#fff'; c.fillRect(720 + 110 * 260 / 700, 4, 2, 12); c.fillStyle = '#ffd740'; c.fillRect(720 + 110 * 560 / 700, 4, 2, 12);
+    if (hintT > 0 && E.state === 'play') { c.globalAlpha = Math.min(1, hintT); c.fillStyle = 'rgba(0,0,0,.6)'; c.fillRect(0, H - 46, W, 34); E.text(c, E.input.touch ? LEVELS[lvl].hint.replace('mouse or WASD', 'drag anywhere').replace('Hold click / Space', 'Hold REEL').replace('Press R to restart', 'Pause and quit to retry') : LEVELS[lvl].hint, W / 2, H - 23, 16, '#fff', 'center'); c.globalAlpha = 1; }
+  };
+
+  G._dbg = { s: () => ({ A, F, crystals, foes, lvl, hp, time, gates }), win: () => (crystals.length = 0), load: startLevel };
+  E.start(G);
+})();
+
+</script>
+</body>
+</html>

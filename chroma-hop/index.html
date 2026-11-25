@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>CHROMA HOP</title>
+<style>html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0a0820;touch-action:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+canvas{position:absolute;display:block;image-rendering:auto}</style></head>
+<body><canvas id="c"></canvas>
+<script>
+/* ===== Shared micro-engine (inlined into each game at build time) =====
+   Logical resolution 960x540, letterboxed. Handles: (no platform SDK,
+   loaded async with offline fallback), input (keys/mouse/touch + virtual
+   buttons), procedural audio, juice (shake/particles/flash/hitstop/popups),
+   title/pause/gameover flow, best-score storage. */
+(function () {
+  'use strict';
+  const W = 960, H = 540;
+  const E = (window.Engine = { W, H, t: 0, state: 'boot' });
+
+  /* ---------- storage ---------- */
+  // Progress (best scores, unlocked levels, mute) is saved in the browser's localStorage.
+  E.load = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } };
+  E.save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+
+  /* ---------- math helpers ---------- */
+  E.rand = (a, b) => a + Math.random() * (b - a);
+  E.randi = (a, b) => Math.floor(E.rand(a, b + 1));
+  E.clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  E.lerp = (a, b, t) => a + (b - a) * t;
+  E.pick = (arr) => arr[(Math.random() * arr.length) | 0];
+  E.dist = (ax, ay, bx, by) => Math.hypot(bx - ax, by - ay);
+  E.aabb = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  /* ---------- game-flow hooks (no platform SDK; kept so game code can call them) ---------- */
+  const SDK = (E.sdk = { start() {}, stop() {}, happy() {}, midgame(cb) { cb && cb(); } });
+
+  /* ---------- canvas ---------- */
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  E.ctx = ctx; E.canvas = canvas;
+  let scale = 1, offX = 0, offY = 0, dpr = 1;
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    const cw = Math.floor(W * scale), ch = Math.floor(H * scale);
+    offX = (vw - cw) / 2; offY = (vh - ch) / 2;
+    canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+    canvas.style.left = offX + 'px'; canvas.style.top = offY + 'px';
+    canvas.width = Math.floor(cw * dpr); canvas.height = Math.floor(ch * dpr);
+  }
+  window.addEventListener('resize', resize); resize();
+
+  /* ---------- input ---------- */
+  const keys = {}, pressed = {}, uiPressed = {};
+  E.uiHit = (...ks) => ks.some((k) => uiPressed[k]);
+  E.press = (k) => { pressed[k] = true; }; // used by automated tests
+  E.clearPressed = () => { for (const k in pressed) delete pressed[k]; };
+  E.inUI = (x, y) => y < 56 && x > W - 110;
+  E.keys = keys;
+  E.down = (...ks) => ks.some((k) => keys[k]);
+  E.hit = (...ks) => ks.some((k) => pressed[k]);
+  const BLOCK = ['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+  window.addEventListener('keydown', (e) => {
+    if (BLOCK.includes(e.code)) e.preventDefault();
+    Audio.unlock(); E.touchMode = false;
+    if (!keys[e.code]) { pressed[e.code] = true; uiPressed[e.code] = true; }
+    keys[e.code] = true;
+  });
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; if (E.state === 'play') E.pause(true); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && E.state === 'play') E.pause(true); });
+
+  const ptr = (E.pointer = { x: W / 2, y: H / 2, down: false, clicked: false, released: false });
+  const toLogical = (cx, cy) => [(cx - offX) / scale, (cy - offY) / scale];
+  E.touchButtons = []; // {key,label,x,y,r}
+  const activeTouches = new Map(); // id -> key | 'ptr'
+  function btnAt(x, y) {
+    for (const b of E.touchButtons) if ((x - b.x) ** 2 + (y - b.y) ** 2 < (b.r * 1.25) ** 2) return b;
+    return null;
+  }
+  canvas.addEventListener('mousedown', (e) => {
+    Audio.unlock(); E.touchMode = false;
+    [ptr.x, ptr.y] = toLogical(e.clientX, e.clientY);
+    ptr.down = true; ptr.clicked = true; ptr.uiClick = true; ptr.button = e.button;
+  });
+  window.addEventListener('mousemove', (e) => { [ptr.x, ptr.y] = toLogical(e.clientX, e.clientY); });
+  window.addEventListener('mouseup', () => { if (ptr.down) ptr.released = true; ptr.down = false; });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  function tstart(e) {
+    e.preventDefault(); Audio.unlock(); E.touchMode = true;
+    for (const t of e.changedTouches) {
+      const [x, y] = toLogical(t.clientX, t.clientY);
+      const b = E.state === 'play' ? btnAt(x, y) : null;
+      if (b) { activeTouches.set(t.identifier, b.key); if (!keys[b.key]) { pressed[b.key] = true; uiPressed[b.key] = true; } keys[b.key] = true; }
+      else { activeTouches.set(t.identifier, 'ptr'); ptr.x = x; ptr.y = y; ptr.down = true; ptr.clicked = true; ptr.uiClick = true; }
+    }
+  }
+  function tmove(e) {
+    e.preventDefault();
+    for (const t of e.changedTouches) if (activeTouches.get(t.identifier) === 'ptr') [ptr.x, ptr.y] = toLogical(t.clientX, t.clientY);
+  }
+  function tend(e) {
+    e.preventDefault(); Audio.unlock();
+    for (const t of e.changedTouches) {
+      const k = activeTouches.get(t.identifier);
+      activeTouches.delete(t.identifier);
+      if (k === 'ptr') { if (![...activeTouches.values()].includes('ptr')) { ptr.down = false; ptr.released = true; } }
+      else if (k && ![...activeTouches.values()].includes(k)) keys[k] = false;
+    }
+  }
+  canvas.addEventListener('touchstart', tstart, { passive: false });
+  canvas.addEventListener('touchmove', tmove, { passive: false });
+  canvas.addEventListener('touchend', tend, { passive: false });
+  canvas.addEventListener('touchcancel', tend, { passive: false });
+  E.touchMode = 'ontouchstart' in window && navigator.maxTouchPoints > 0 && !matchMedia('(pointer:fine)').matches;
+
+  /* ---------- audio (procedural) ---------- */
+  const Audio = (E.audio = { ctx: null, master: null, userMuted: E.load('mute_' + document.title, false) });
+  Audio.unlock = function () {
+    try {
+      if (!Audio.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+        Audio.ctx = new AC(); Audio.master = Audio.ctx.createGain(); Audio.master.connect(Audio.ctx.destination);
+        Audio.apply();
+      }
+      if (Audio.ctx.state === 'suspended') Audio.ctx.resume();
+    } catch (e) {}
+  };
+  Audio.isMuted = () => Audio.userMuted;
+  Audio.apply = () => { if (Audio.master) Audio.master.gain.value = Audio.isMuted() ? 0 : 0.5; };
+  Audio.toggle = () => { Audio.userMuted = !Audio.userMuted; E.save('mute_' + document.title, Audio.userMuted); Audio.apply(); };
+  /* tone(freq, dur, type, vol, slideTo, delay) */
+  E.tone = function (f, d = 0.1, type = 'square', v = 0.2, slide = 0, delay = 0) {
+    const a = Audio.ctx; if (!a || Audio.isMuted()) return;
+    const t0 = a.currentTime + delay, o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t0);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, slide), t0 + d);
+    g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + d);
+    o.connect(g); g.connect(Audio.master); o.start(t0); o.stop(t0 + d + 0.02);
+  };
+  let noiseBuf = null;
+  E.noise = function (d = 0.2, v = 0.3, freq = 1200, delay = 0) {
+    const a = Audio.ctx; if (!a || Audio.isMuted()) return;
+    if (!noiseBuf) { noiseBuf = a.createBuffer(1, a.sampleRate, a.sampleRate); const ch = noiseBuf.getChannelData(0); for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1; }
+    const t0 = a.currentTime + delay, s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+    s.buffer = noiseBuf; f.type = 'lowpass'; f.frequency.value = freq;
+    g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + d);
+    s.connect(f); f.connect(g); g.connect(Audio.master); s.start(t0); s.stop(t0 + d + 0.05);
+  };
+  /* simple generative music: scale + bass, scheduled ahead */
+  const Music = (E.music = { on: false, step: 0, next: 0, bpm: 120, scale: [0, 3, 5, 7, 10], root: 220, pattern: null });
+  Music.start = (opts) => { Object.assign(Music, opts || {}); Music.on = true; Music.step = 0; Music.next = Audio.ctx ? Audio.ctx.currentTime + 0.05 : 0; };
+  Music.stop = () => { Music.on = false; };
+  function musicTick() {
+    const a = Audio.ctx; if (!a || !Music.on || Audio.isMuted()) { if (a) Music.next = a.currentTime + 0.05; return; }
+    const spb = 60 / Music.bpm / 2;
+    while (Music.next < a.currentTime + 0.15) {
+      const s = Music.step, t = Music.next - a.currentTime;
+      const deg = Music.pattern ? Music.pattern[s % Music.pattern.length] : null;
+      if (deg != null && deg >= 0) { const n = Music.scale[deg % Music.scale.length] + 12 * Math.floor(deg / Music.scale.length); E.tone(Music.root * Math.pow(2, n / 12), spb * 0.9, 'triangle', 0.05, 0, t); }
+      if (s % 8 === 0) E.tone(Music.root / 2, spb * 3, 'sine', 0.09, 0, t);
+      if (s % 8 === 4) E.tone(Music.root / 2 * Math.pow(2, Music.scale[3] / 12), spb * 3, 'sine', 0.07, 0, t);
+      if (s % 4 === 2) E.noise(0.04, 0.04, 6000, t);
+      Music.step++; Music.next += spb;
+    }
+  }
+
+  /* ---------- juice ---------- */
+  let shakeAmt = 0, flashA = 0, flashC = '#fff', hitstop = 0;
+  E.shake = (a) => { shakeAmt = Math.max(shakeAmt, a); };
+  E.flash = (c = '#fff', a = 0.5) => { flashC = c; flashA = a; };
+  E.hitstop = (s) => { hitstop = Math.max(hitstop, s); };
+  const parts = (E.particles = []);
+  E.burst = function (x, y, n, color, spd = 4, life = 30, size = 3, grav = 0.1) {
+    for (let i = 0; i < n && parts.length < 900; i++) {
+      const a = Math.random() * Math.PI * 2, s = Math.random() * spd;
+      parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: life * (0.5 + Math.random() * 0.5), max: life, color, size: size * (0.5 + Math.random()), grav });
+    }
+  };
+  E.spark = (x, y, vx, vy, color, life = 20, size = 3, grav = 0) => { if (parts.length < 900) parts.push({ x, y, vx, vy, life, max: life, color, size, grav }); };
+  const popups = [];
+  E.popup = (x, y, text, color = '#fff', size = 22) => popups.push({ x, y, text, color, size, life: 50 });
+  function updateFx() {
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i]; p.x += p.vx; p.y += p.vy; p.vy += p.grav; p.vx *= 0.98; p.life--;
+      if (p.life <= 0) parts.splice(i, 1);
+    }
+    for (let i = popups.length - 1; i >= 0; i--) { const p = popups[i]; p.y -= 0.8; if (--p.life <= 0) popups.splice(i, 1); }
+    shakeAmt *= 0.88; if (shakeAmt < 0.2) shakeAmt = 0; flashA *= 0.9;
+  }
+  E.drawParticles = function (c, camX = 0, camY = 0) {
+    for (const p of parts) {
+      c.globalAlpha = Math.max(0, p.life / p.max); c.fillStyle = p.color;
+      const s = p.size * (0.4 + 0.6 * p.life / p.max);
+      c.fillRect(p.x - camX - s / 2, p.y - camY - s / 2, s, s);
+    }
+    c.globalAlpha = 1;
+  };
+  E.drawPopups = function (c, camX = 0, camY = 0) {
+    for (const p of popups) { c.globalAlpha = Math.min(1, p.life / 20); E.text(p.text, p.x - camX, p.y - camY, p.size, p.color); }
+    c.globalAlpha = 1;
+  };
+  E.clearFx = () => { parts.length = 0; popups.length = 0; };
+
+  /* ---------- text / ui ---------- */
+  E.font = '"Trebuchet MS", "Segoe UI", system-ui, sans-serif';
+  E.text = function (s, x, y, size = 24, color = '#fff', align = 'center', outline = true) {
+    size = Math.max(size, 13); // stays readable on small screens
+    ctx.font = `bold ${size}px ${E.font}`; ctx.textAlign = align; ctx.textBaseline = 'middle';
+    if (outline) { ctx.lineJoin = 'round'; ctx.lineWidth = Math.max(3, size / 6); ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.strokeText(s, x, y); }
+    ctx.fillStyle = color; ctx.fillText(s, x, y);
+  };
+  let buttons = [];
+  E.button = function (label, x, y, w, h, onClick, color = '#ffffff') {
+    const hov = ptr.x > x - w / 2 && ptr.x < x + w / 2 && ptr.y > y - h / 2 && ptr.y < y + h / 2;
+    ctx.fillStyle = hov ? color : 'rgba(0,0,0,0.45)';
+    ctx.strokeStyle = color; ctx.lineWidth = 3;
+    roundRect(x - w / 2, y - h / 2, w, h, 12); ctx.fill(); ctx.stroke();
+    E.text(label, x, y + 1, Math.min(28, h * 0.5), hov ? '#111' : color, 'center', !hov);
+    buttons.push({ x: x - w / 2, y: y - h / 2, w, h, onClick });
+  };
+  function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+  E.roundRect = roundRect;
+
+  /* ---------- game flow ---------- */
+  let G = null; // game definition
+  E.best = 0; E.score = 0; E.lastStats = null; E.newBest = false;
+  E.pause = (auto) => { if (E.state !== 'play') return; for (const k in uiPressed) delete uiPressed[k]; E.state = 'pause'; if (auto !== true) SDK.stop(); Music.stop(); };
+  E.resume = () => { if (E.state !== 'pause') return; E.state = 'play'; SDK.start(); G.music && Music.start(G.music); };
+  E.startRun = function () {
+    E.clearFx(); E.score = 0; E.newBest = false;
+    G.start && G.start();
+    E.state = 'play'; SDK.start();
+    G.music && Music.start(G.music);
+  };
+  E.gameOver = function (score, stats) {
+    if (E.state !== 'play') return;
+    E.score = Math.floor(score); E.lastStats = stats || null;
+    if (E.score > E.best) { E.best = E.score; E.save(G.id + '_best', E.best); E.newBest = E.score > 0; if (E.newBest) SDK.happy(); }
+    E.state = 'over'; E.overT = 0; SDK.stop(); Music.stop();
+  };
+  E.toTitle = () => { E.state = 'title'; SDK.stop(); Music.stop(); };
+  /* restart goes through midgame ad (only between runs) */
+  E.retry = () => { E.state = 'ad'; SDK.midgame(() => E.startRun()); };
+
+  function drawPauseIcon() {
+    if (E.state !== 'play') return;
+    const x = W - 34, y = 30;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.arc(x, y, 20, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillRect(x - 7, y - 9, 5, 18); ctx.fillRect(x + 2, y - 9, 5, 18);
+    buttons.push({ x: x - 22, y: y - 22, w: 44, h: 44, onClick: E.pause });
+    // mute icon
+    const mx = W - 84;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.arc(mx, y, 20, 0, 7); ctx.fill();
+    drawSpeaker(mx, y);
+    buttons.push({ x: mx - 22, y: y - 22, w: 44, h: 44, onClick: Audio.toggle });
+  }
+  function drawSpeaker(x, y) {
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(x - 9, y - 4); ctx.lineTo(x - 4, y - 4); ctx.lineTo(x + 2, y - 10); ctx.lineTo(x + 2, y + 10); ctx.lineTo(x - 4, y + 4); ctx.lineTo(x - 9, y + 4); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    if (Audio.userMuted) { ctx.beginPath(); ctx.moveTo(x + 5, y - 5); ctx.lineTo(x + 12, y + 5); ctx.moveTo(x + 12, y - 5); ctx.lineTo(x + 5, y + 5); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.arc(x + 3, y, 7, -0.8, 0.8); ctx.stroke(); }
+  }
+  function drawTouchButtons() {
+    if (!E.touchMode || E.state !== 'play') return;
+    for (const b of E.touchButtons) {
+      ctx.globalAlpha = keys[b.key] ? 0.55 : 0.28;
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill();
+      ctx.globalAlpha = 0.9; E.text(b.label, b.x, b.y, b.r * 0.55, '#fff');
+    }
+    ctx.globalAlpha = 1;
+  }
+  function overlay(a = 0.55) { ctx.fillStyle = `rgba(5,5,15,${a})`; ctx.fillRect(0, 0, W, H); }
+
+  function drawTitle() {
+    G.drawBackground ? G.drawBackground(ctx, E.t) : (ctx.fillStyle = '#111', ctx.fillRect(0, 0, W, H));
+    overlay(0.35);
+    const bob = Math.sin(E.t * 2.2) * 6;
+    E.text(G.title, W / 2, 140 + bob, 78, G.color || '#fff');
+    E.text(G.tagline || '', W / 2, 205, 22, '#ddd');
+    E.button(E.touchMode ? 'TAP TO PLAY' : 'PLAY', W / 2, 290, 260, 64, E.startRun, G.color || '#fff');
+    const lines = (E.touchMode ? G.controlsTouch : G.controls) || [];
+    lines.forEach((l, i) => E.text(l, W / 2, 360 + i * 28, 18, '#cfd'));
+    if (E.best > 0) E.text('BEST: ' + E.best, W / 2, H - 40, 22, '#ffd85a');
+    E.text('M: mute', W - 60, H - 20, 14, '#999');
+    if (E.uiHit('Space', 'Enter')) E.startRun();
+  }
+  function drawPause() {
+    G.draw(ctx); overlay(0.6);
+    E.text('PAUSED', W / 2, 170, 64, '#fff');
+    E.button('RESUME', W / 2, 270, 240, 58, E.resume, G.color);
+    E.button(Audio.userMuted ? 'SOUND: OFF' : 'SOUND: ON', W / 2, 340, 240, 50, Audio.toggle, '#aaa');
+    E.button('MENU', W / 2, 405, 240, 50, E.toTitle, '#aaa');
+    if (E.uiHit('Escape', 'KeyP')) E.resume();
+  }
+  function drawOver() {
+    G.draw(ctx); overlay(Math.min(0.7, E.overT / 40));
+        if (E.overT < 25) return;
+    E.text(G.overTitle || 'GAME OVER', W / 2, 120, 64, G.color || '#fff');
+    E.text('SCORE  ' + E.score, W / 2, 195, 40, '#fff');
+    E.text(E.newBest ? 'NEW BEST!' : 'BEST  ' + E.best, W / 2, 240, 26, '#ffd85a');
+    if (E.lastStats) E.lastStats.forEach((s, i) => E.text(s, W / 2, 285 + i * 26, 18, '#cde'));
+    const by = 285 + (E.lastStats ? E.lastStats.length : 0) * 26 + 40;
+    E.button(E.touchMode ? 'TAP TO RETRY' : 'RETRY  (Space)', W / 2, by, 280, 58, E.retry, G.color);
+    E.button('MENU', W / 2, by + 68, 200, 46, E.toTitle, '#aaa');
+    if (E.overT > 40 && E.uiHit('Space', 'Enter', 'KeyR')) E.retry();
+  }
+
+  /* ---------- main loop (fixed 60Hz) ---------- */
+  let last = 0, acc = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.1, (now - last) / 1000 || 0); last = now; acc += dt;
+    musicTick();
+    if (E.uiHit('KeyM')) Audio.toggle();
+    let steps = 0;
+    while (acc >= 1 / 60 && steps < 4) {
+      acc -= 1 / 60; steps++;
+      if (E.state === 'play') {
+        if (E.hit('Escape', 'KeyP')) { E.pause(); }
+        else if (hitstop > 0) hitstop -= 1 / 60;
+        else { G.update(1 / 60); updateFx(); }
+      } else { updateFx(); if (E.state === 'over') E.overT++; }
+      for (const k in pressed) delete pressed[k];
+      ptr.clicked = false; ptr.released = false;
+    }
+    if (acc > 0.2) acc = 0;
+    E.t = now / 1000;
+    render();
+    for (const k in uiPressed) delete uiPressed[k];
+    ptr.uiClick = false;
+  }
+  function render() {
+    buttons = [];
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+    ctx.save();
+    if (shakeAmt > 0 && E.state === 'play') ctx.translate(E.rand(-shakeAmt, shakeAmt), E.rand(-shakeAmt, shakeAmt));
+    if (E.state === 'title') drawTitle();
+    else if (E.state === 'play') { G.draw(ctx); drawTouchButtons(); }
+    else if (E.state === 'pause') drawPause();
+    else if (E.state === 'over') drawOver();
+    else if (E.state === 'ad') { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); E.text('...', W / 2, H / 2, 40, '#888'); }
+    else if (E.state === 'boot') { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); E.text('LOADING', W / 2, H / 2, 30, '#888'); }
+    ctx.restore();
+    if (flashA > 0.02) { ctx.globalAlpha = flashA; ctx.fillStyle = flashC; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+    drawPauseIcon();
+    if (ptr.uiClick) {
+      for (let i = buttons.length - 1; i >= 0; i--) {
+        const b = buttons[i];
+        if (ptr.x >= b.x && ptr.x <= b.x + b.w && ptr.y >= b.y && ptr.y <= b.y + b.h) { E.tone(660, 0.06, 'square', 0.1); ptr.uiClick = false; b.onClick(); break; }
+      }
+    }
+  }
+
+  E.run = async function (game) {
+    G = E.game = game;
+    requestAnimationFrame(frame);
+    E.best = E.load(G.id + '_best', 0);
+    Audio.userMuted = E.load('mute_' + document.title, false); Audio.apply();
+    G.init && G.init();
+    E.state = 'title';
+  };
+})();
+
+</script>
+<script>
+// BG:#0a0820
+/* CHROMA HOP — an endless runner where you only exist in one colour at a time.
+   You can only stand on platforms of your colour and only pass gates of your colour.
+   Swap colours mid-air to slip through gates, then swap back before you land. */
+(function () {
+  const E = Engine, W = E.W, H = E.H;
+  const COL = ['#2ef2ff', '#ff3dbb'], GLOW = ['rgba(46,242,255,', 'rgba(255,61,187,'];
+  const GATE_H = 150;
+  let P, plats, gates, orbs, prisms, camX, speed, dist, genX, genY, combo, comboT, bonus, gatesPassed, runT, prism, rings, stars;
+
+  function plat(x, y, w, c) { plats.push({ x, y, w, c }); }
+  function gen(upto) {
+    while (genX < upto) {
+      const diff = Math.min(1, dist / 25000);
+      const gapK = speed / 6;
+      const r = Math.random();
+      const c = Math.random() < 0.5 ? 0 : 1;
+      const gap = () => E.rand(60, 100 + diff * 50) * gapK;
+      const ny = () => (genY = E.clamp(genY + E.rand(-70, 70), 250, 450));
+      if (r < 0.32) { // swap steps
+        const n = E.randi(3, 5); let cc = c;
+        for (let i = 0; i < n; i++) { genX += gap(); const w = E.rand(170, 260); plat(genX, ny(), w, cc); orbLine(genX + 40, genY - 50, 3, cc); genX += w; cc = 1 - cc; }
+      } else if (r < 0.62) { // gate run: long platform with other-colour gates
+        genX += gap(); const w = E.rand(700, 950); plat(genX, ny(), w, c);
+        const ng = diff > 0.4 && Math.random() < 0.5 ? 2 : 1;
+        for (let i = 0; i < ng; i++) { const gx = genX + w * ((i + 1) / (ng + 1)); gates.push({ x: gx, y: genY - GATE_H, h: GATE_H, c: Math.random() < 0.75 ? 1 - c : c, passed: false }); orbLine(gx - 60, genY - 110, 5, 1 - c, true); }
+        genX += w;
+      } else if (r < 0.82) { // split lanes
+        genX += gap(); const base = ny(), w = E.rand(500, 700);
+        plat(genX, base - 120, w, c); plat(genX + 40, base + 30 > 480 ? 480 : base + 30, w - 40, 1 - c);
+        orbLine(genX + 60, base - 170, 6, c); orbLine(genX + 100, Math.min(480, base + 30) - 50, 6, 1 - c);
+        if (Math.random() < 0.18) prisms.push({ x: genX + w / 2, y: base - 230, got: false });
+        genX += w; genY = base;
+      } else { // stairs of same colour with a colour-flip at the top
+        let cc = c; const n = E.randi(3, 4);
+        for (let i = 0; i < n; i++) { genX += gap() * 0.8; genY = E.clamp(genY - 50, 230, 450); const w = E.rand(140, 200); plat(genX, genY, w, i === n - 1 ? 1 - cc : cc); orbLine(genX + 30, genY - 50, 2, cc); genX += w; }
+      }
+    }
+  }
+  function orbLine(x, y, n, c, arc) { for (let i = 0; i < n; i++) orbs.push({ x: x + i * 30, y: y - (arc ? Math.sin((i / Math.max(1, n - 1)) * Math.PI) * 40 : 0), c, got: false }); }
+  const solidFor = (p) => prism > 0 || p.c === P.c;
+  function swap() {
+    P.c = 1 - P.c; P.swapFx = 10;
+    E.tone(P.c ? 660 : 520, 0.06, 'square', 0.08, P.c ? 990 : 780);
+    for (let i = 0; i < 10; i++) { const a = Math.random() * 6.28; E.spark(P.x, P.y, Math.cos(a) * 3, Math.sin(a) * 3, COL[P.c], 16, 3); }
+  }
+  function die(msg) {
+    E.shake(18); E.flash(COL[P.c], 0.5); E.hitstop(0.08);
+    for (let i = 0; i < 50; i++) { const a = Math.random() * 6.28, s = E.rand(2, 9); E.spark(P.x, P.y, Math.cos(a) * s, Math.sin(a) * s, E.pick(COL), 50, 6, 0.15); }
+    E.noise(0.6, 0.45, 2500); E.tone(440, 0.5, 'sawtooth', 0.14, 55);
+    E.gameOver(score(), [msg, 'Distance ' + Math.floor(dist / 10) + ' m   ·   Gates ' + gatesPassed]);
+  }
+  const score = () => Math.floor(dist / 10) + bonus;
+
+  const game = {
+    id: 'chroma-hop', title: 'CHROMA HOP', color: '#2ef2ff',
+    tagline: 'Exist in one colour at a time. Stand on it. Pass through it. Swap to survive.',
+    overTitle: 'DESATURATED',
+    controls: ['SPACE / W / UP / LEFT CLICK : jump (double jump)', 'SHIFT / X / S / DOWN / RIGHT CLICK : swap colour', 'Only your colour is solid. Gates of the other colour shatter you.', 'Swap mid-air to pass a gate, swap back before landing!'],
+    controlsTouch: ['Right side: JUMP   ·   SWAP button: change colour', 'Only your colour is solid', 'Swap mid-air to slip through gates'],
+    music: { bpm: 128, root: 233, scale: [0, 2, 4, 7, 9], pattern: [0, 2, 4, 2, 7, 4, 2, 4, 5, 4, 2, 0, 3, 2, 1, -1] },
+    init() {
+      stars = []; for (let i = 0; i < 70; i++) stars.push({ x: Math.random() * W, y: Math.random() * 300, s: Math.random() * 0.4 + 0.1 });
+      E.touchButtons = [{ key: 'KeyX', label: 'SWAP', x: 90, y: H - 90, r: 62 }, { key: 'Space', label: 'JUMP', x: W - 90, y: H - 90, r: 62 }];
+    },
+    start() {
+      P = { x: 220, y: 360, vy: 0, r: 14, c: 0, ground: false, jumps: 2, coyote: 0, buf: 0, rot: 0, swapFx: 0, squash: 1 };
+      plats = []; gates = []; orbs = []; prisms = []; rings = [];
+      plat(-200, 400, 1100, 0); genX = 900; genY = 400;
+      camX = 0; speed = 6; dist = 0; combo = 0; comboT = 0; bonus = 0; gatesPassed = 0; runT = 0; prism = 0;
+      gen(W * 3);
+    },
+    update() {
+      runT++;
+      speed = Math.min(12.5, 6 + runT * 0.0014);
+      // input (mouse: left jump, right swap; touch handled via buttons; tap on the right half also jumps)
+      const ptrJump = E.pointer.clicked && !E.inUI(E.pointer.x, E.pointer.y) && E.pointer.button !== 2;
+      const ptrSwap = E.pointer.clicked && E.pointer.button === 2 && !E.touchMode;
+      if (E.hit('Space', 'KeyW', 'ArrowUp', 'KeyZ') || ptrJump) P.buf = 8;
+      if (E.hit('ShiftLeft', 'ShiftRight', 'KeyX', 'KeyS', 'ArrowDown', 'KeyK') || ptrSwap) swap();
+      if (P.buf > 0) {
+        P.buf--;
+        if (P.coyote > 0) { P.vy = -11.6; P.coyote = 0; P.jumps = 1; P.buf = 0; P.ground = false; P.squash = 0.6; E.tone(392, 0.08, 'triangle', 0.12, 784); }
+        else if (P.jumps > 0) { P.vy = -10.4; P.jumps = 0; P.buf = 0; P.squash = 0.7; E.tone(587, 0.08, 'triangle', 0.12, 1175); rings.push({ x: P.x + camX, y: P.y + 10, r: 6, life: 18 }); }
+      }
+      if (!E.down('Space', 'KeyW', 'ArrowUp', 'KeyZ') && !E.pointer.down && P.vy < -4) P.vy *= 0.85;
+      const prevB = P.y + P.r;
+      P.vy = Math.min(15, P.vy + 0.62); P.y += P.vy;
+      const wx = P.x + camX; // world x
+      const was = P.ground; P.ground = false;
+      for (const p of plats) {
+        if (!solidFor(p)) continue;
+        if (wx + P.r * 0.6 > p.x && wx - P.r * 0.6 < p.x + p.w && P.vy >= 0 && prevB <= p.y + 3 && P.y + P.r >= p.y) { P.y = p.y - P.r; P.vy = 0; P.ground = true; P.jumps = 2; }
+      }
+      if (P.ground) { P.coyote = 6; if (!was) { P.squash = 1.35; E.tone(150, 0.05, 'sine', 0.12); for (let i = 0; i < 6; i++) E.spark(wx, P.y + P.r, E.rand(-3, 1), -E.rand(0, 2), COL[P.c], 14, 3, 0.1); } }
+      else P.coyote--;
+      P.squash = E.lerp(P.squash, 1, 0.2);
+      P.rot += P.ground ? speed * 0.05 : 0.18;
+      if (P.swapFx > 0) P.swapFx--;
+      if (prism > 0) prism--;
+      if (P.y > H + 40) return die('Fell through the spectrum');
+
+      // gates
+      for (const g of gates) {
+        if (g.passed) continue;
+        if (wx + P.r > g.x && wx - P.r < g.x + 14 && P.y + P.r > g.y && P.y - P.r < g.y + g.h) {
+          if (g.c === P.c || prism > 0) {
+            g.passed = true; gatesPassed++; combo++; comboT = 120; const pts = 25 * Math.min(combo, 8); bonus += pts;
+            E.shake(4); E.tone(880, 0.12, 'square', 0.08, 1760); E.popup(wx, g.y - 14, 'PHASE +' + pts, COL[g.c], 20);
+            for (let i = 0; i < 18; i++) E.spark(g.x + 7, g.y + Math.random() * g.h, E.rand(1, 6), E.rand(-2, 2), COL[g.c], 24, 4);
+          } else return die('Shattered on a ' + (g.c ? 'magenta' : 'cyan') + ' gate');
+        }
+      }
+      // orbs
+      for (const o of orbs) {
+        if (o.got || Math.abs(o.x - wx) > 22 || Math.abs(o.y - P.y) > 24) continue;
+        if (o.c === P.c || prism > 0) { o.got = true; combo++; comboT = 90; bonus += 5 * Math.min(combo, 10); E.tone(1046 + Math.min(combo, 12) * 40, 0.05, 'square', 0.06); E.burst(o.x, o.y, 5, COL[o.c], 2, 14, 3, 0); }
+      }
+      for (const p of prisms) if (!p.got && Math.abs(p.x - wx) < 26 && Math.abs(p.y - P.y) < 26) {
+        p.got = true; prism = 300; bonus += 100; E.flash('#fff', 0.4); E.shake(6); E.popup(wx, p.y - 30, 'PRISM! all colours solid', '#fff', 22);
+        [523, 659, 784, 988, 1175].forEach((f, i) => E.tone(f, 0.12, 'triangle', 0.1, 0, i * 0.05)); E.sdk.happy();
+      }
+      if (comboT > 0 && --comboT === 0) combo = 0;
+      for (let i = rings.length - 1; i >= 0; i--) { rings[i].r += 2.5; if (--rings[i].life <= 0) rings.splice(i, 1); }
+      if (runT % 2 === 0) E.spark(wx - 8, P.y + E.rand(-6, 6), -E.rand(1, 3), 0, prism > 0 ? E.pick(COL) : COL[P.c], 18, 4);
+
+      camX += speed; dist += speed;
+      gen(camX + W * 2.5);
+      const cut = camX - 300;
+      plats = plats.filter((p) => p.x + p.w > cut); gates = gates.filter((g) => g.x > cut); orbs = orbs.filter((o) => o.x > cut && !o.got); prisms = prisms.filter((p) => p.x > cut && !p.got);
+      E.score = score();
+    },
+    drawBackground(c, t) { bg(c, t * 60); },
+    draw(c) {
+      bg(c, camX);
+      for (const p of plats) {
+        const x = p.x - camX; if (x > W || x + p.w < 0) continue;
+        const on = solidFor(p);
+        c.globalAlpha = on ? 1 : 0.28;
+        c.fillStyle = GLOW[p.c] + (on ? '0.25)' : '0.1)'); c.fillRect(x - 4, p.y - 4, p.w + 8, 22);
+        c.fillStyle = COL[p.c]; c.fillRect(x, p.y, p.w, 5);
+        c.fillStyle = GLOW[p.c] + '0.35)'; c.fillRect(x, p.y + 5, p.w, 9);
+        if (!on) { c.strokeStyle = COL[p.c]; c.setLineDash([8, 8]); c.lineWidth = 1; c.strokeRect(x, p.y, p.w, 14); c.setLineDash([]); }
+        c.globalAlpha = 1;
+      }
+      for (const g of gates) {
+        const x = g.x - camX; if (x < -30 || x > W + 30) continue;
+        const ok = g.c === P.c || prism > 0;
+        c.globalAlpha = g.passed ? 0.2 : 1;
+        c.fillStyle = GLOW[g.c] + '0.2)'; c.fillRect(x - 10, g.y, 34, g.h);
+        c.fillStyle = COL[g.c]; c.fillRect(x, g.y, 14, g.h);
+        c.fillStyle = 'rgba(255,255,255,0.6)'; for (let y = g.y + ((E.t * 80) % 20); y < g.y + g.h; y += 20) c.fillRect(x + 3, y, 8, 3);
+        if (!ok && !g.passed) { c.strokeStyle = '#fff'; c.lineWidth = 2; c.beginPath(); c.moveTo(x - 6, g.y - 18); c.lineTo(x + 20, g.y - 4); c.moveTo(x + 20, g.y - 18); c.lineTo(x - 6, g.y - 4); c.stroke(); }
+        c.globalAlpha = 1;
+      }
+      for (const o of orbs) {
+        const x = o.x - camX; if (x < -20 || x > W + 20) continue;
+        const on = o.c === P.c || prism > 0;
+        c.globalAlpha = on ? 1 : 0.3; c.fillStyle = COL[o.c]; c.beginPath(); c.arc(x, o.y + Math.sin(E.t * 5 + o.x) * 3, on ? 6 : 4, 0, 7); c.fill(); c.globalAlpha = 1;
+      }
+      for (const p of prisms) {
+        const x = p.x - camX; if (x < -30 || x > W + 30) continue;
+        c.save(); c.translate(x, p.y + Math.sin(E.t * 3) * 5); c.rotate(E.t);
+        const gr = c.createLinearGradient(-14, -14, 14, 14); gr.addColorStop(0, COL[0]); gr.addColorStop(0.5, '#fff'); gr.addColorStop(1, COL[1]);
+        c.fillStyle = gr; c.beginPath(); c.moveTo(0, -16); c.lineTo(14, 10); c.lineTo(-14, 10); c.fill(); c.restore();
+      }
+      c.strokeStyle = COL[P.c]; c.lineWidth = 2;
+      for (const r of rings) { c.globalAlpha = r.life / 18; c.beginPath(); c.ellipse(r.x - camX, r.y, r.r * 1.6, r.r * 0.5, 0, 0, 7); c.stroke(); }
+      c.globalAlpha = 1;
+      E.drawParticles(c, camX, 0);
+      // player
+      c.save(); c.translate(P.x, P.y + P.r); c.scale(1 / Math.sqrt(P.squash), P.squash); c.translate(0, -P.r);
+      const pc = prism > 0 ? COL[(runT >> 3) % 2] : COL[P.c];
+      c.fillStyle = GLOW[P.c] + '0.3)'; c.beginPath(); c.arc(0, 0, P.r + 8 + P.swapFx, 0, 7); c.fill();
+      c.fillStyle = pc; c.beginPath(); c.arc(0, 0, P.r, 0, 7); c.fill();
+      c.fillStyle = '#fff'; c.beginPath(); c.arc(5, -3, 4.5, 0, 7); c.arc(-3, -3, 3.5, 0, 7); c.fill();
+      c.fillStyle = '#0a0820'; c.beginPath(); c.arc(6.5, -2.5, 2, 0, 7); c.arc(-1.8, -2.5, 1.7, 0, 7); c.fill();
+      c.restore();
+      // HUD
+      E.text(String(score()), W / 2, 34, 34, '#fff');
+      E.text(Math.floor(dist / 10) + ' m', W / 2, 62, 16, '#aab');
+      c.fillStyle = 'rgba(0,0,0,0.4)'; E.roundRect(18, 16, 132, 40, 10); c.fill();
+      c.fillStyle = COL[0]; c.globalAlpha = P.c === 0 ? 1 : 0.25; E.roundRect(26, 24, 54, 24, 6); c.fill();
+      c.fillStyle = COL[1]; c.globalAlpha = P.c === 1 ? 1 : 0.25; E.roundRect(88, 24, 54, 24, 6); c.fill(); c.globalAlpha = 1;
+      if (combo >= 3) E.text('COMBO x' + combo, 24, 76, 18, COL[P.c], 'left');
+      if (prism > 0) { c.fillStyle = '#fff'; c.fillRect(W / 2 - 100, 78, 200 * (prism / 300), 5); }
+      E.drawPopups(c, camX, 0);
+    },
+  };
+  function bg(c, cx) {
+    const g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#07061a'); g.addColorStop(0.6, '#1a0b3a'); g.addColorStop(1, '#2a0a3a'); c.fillStyle = g; c.fillRect(0, 0, W, H);
+    for (const s of stars || []) { c.fillStyle = 'rgba(255,255,255,' + s.s * 1.6 + ')'; c.fillRect(((s.x - cx * s.s * 0.2) % W + W) % W, s.y, 2, 2); }
+    // twin moons, one per colour
+    c.fillStyle = 'rgba(46,242,255,0.18)'; c.beginPath(); c.arc(260, 150, 70, 0, 7); c.fill();
+    c.fillStyle = 'rgba(255,61,187,0.18)'; c.beginPath(); c.arc(330, 120, 45, 0, 7); c.fill();
+    // receding floor grid
+    c.strokeStyle = 'rgba(255,61,187,0.18)'; c.lineWidth = 1;
+    for (let i = 0; i < 10; i++) { const y = 440 + i * i * 1.3; c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke(); }
+    const off = (cx * 0.5) % 80;
+    for (let x = -off - 400; x < W + 400; x += 80) { c.beginPath(); c.moveTo(W / 2 + (x - W / 2) * 0.3, 440); c.lineTo(x, H); c.stroke(); }
+    // far skyline bars
+    c.fillStyle = '#120a2a';
+    for (let i = 0; i < 16; i++) { const k = 0.3, w = 70, x = ((i * w - cx * k) % (16 * w) + 16 * w) % (16 * w) - w, h = 60 + ((i * 53) % 110); c.fillRect(x, 440 - h, w - 8, h); }
+  }
+  E.dbg = () => ({ P, plats, gates, camX });
+  E.run(game);
+})();
+
+</script>
+</body></html>

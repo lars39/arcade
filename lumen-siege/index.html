@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Lumen Siege</title>
+<style>
+:root{--accent:#64ffda;--bg:#04070f}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);font-family:"Trebuchet MS",system-ui,sans-serif;color:#fff;
+-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:none;-webkit-tap-highlight-color:transparent}
+#c{position:absolute;display:block;image-rendering:auto}
+#ui{position:absolute;transform-origin:0 0;pointer-events:none}
+#panel{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;pointer-events:auto;
+background:radial-gradient(ellipse at center,rgba(0,0,0,.55),rgba(0,0,0,.85));text-align:center;padding:24px}
+#panel h1{font-size:64px;margin:0;letter-spacing:3px;color:var(--accent);text-shadow:0 0 24px var(--accent),0 4px 0 #000}
+#panel h2{font-size:42px;margin:0 0 6px;color:var(--accent);text-shadow:0 0 16px var(--accent)}
+#panel p{margin:0;font-size:18px;max-width:640px;line-height:1.4;opacity:.92}
+#panel .hint{font-size:16px;opacity:.8}
+#panel .tag{font-size:20px;opacity:.85;margin-bottom:10px}
+#panel button{pointer-events:auto;font:inherit;font-size:22px;font-weight:bold;padding:12px 38px;min-width:240px;border:0;border-radius:12px;cursor:pointer;
+background:var(--accent);color:#111;box-shadow:0 5px 0 rgba(0,0,0,.45),0 0 20px var(--accent);transition:transform .08s}
+#panel button:hover{transform:translateY(-2px) scale(1.03)}
+#panel button:active{transform:translateY(2px)}
+#panel button.sec{background:#333;color:#eee;box-shadow:0 5px 0 rgba(0,0,0,.45)}
+#panel .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center}
+#panel .card{pointer-events:auto;width:210px;min-height:150px;padding:14px;border-radius:14px;background:rgba(20,20,30,.92);border:3px solid var(--accent);cursor:pointer;
+display:flex;flex-direction:column;gap:6px;transition:transform .1s}
+#panel .card:hover{transform:translateY(-4px) scale(1.04)}
+#panel .card b{font-size:20px;color:var(--accent)}
+#panel .card span{font-size:15px;opacity:.9}
+#panel .card i{font-size:34px;font-style:normal}
+#panel .stats{font-size:20px;line-height:1.6}
+.hudbtn{position:fixed;top:10px;width:44px;height:44px;border-radius:10px;border:0;background:rgba(0,0,0,.45);color:#fff;font-size:22px;cursor:pointer;z-index:5}
+#muteBtn{right:10px}#pauseBtn{right:62px;display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui"><div id="panel"></div></div>
+<button id="pauseBtn" class="hudbtn" aria-label="Pause">⏸</button>
+<button id="muteBtn" class="hudbtn" aria-label="Mute">🔊</button>
+<script>
+// ===== Shared mini-engine (inlined into each game at build time) =====
+(function () {
+  'use strict';
+  const W = 960, H = 540;
+  const E = (window.E = { W, H, t: 0, dt: 0, paused: false, state: 'title', muted: false });
+
+  // ---------- storage ----------
+  // Progress (best score, unlocks, mute) is saved in the browser's localStorage.
+  E.load = (k, d) => { try { const v = localStorage.getItem(E.id + ':' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } };
+  E.save = (k, v) => { try { localStorage.setItem(E.id + ':' + k, JSON.stringify(v)); } catch (e) {} };
+
+  // ---------- math ----------
+  E.rand = (a, b) => a + Math.random() * (b - a);
+  E.randi = (a, b) => Math.floor(E.rand(a, b + 1));
+  E.pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+  E.clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  E.lerp = (a, b, t) => a + (b - a) * t;
+  E.dist = (ax, ay, bx, by) => Math.hypot(bx - ax, by - ay);
+  E.angTo = (ax, ay, bx, by) => Math.atan2(by - ay, bx - ax);
+  E.shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+
+  // ---------- game-flow hooks (no platform SDK; kept so game code can call them) ----------
+  const sdk = (E.sdk = {
+    adPlaying: false,
+    gameplayStart() {}, gameplayStop() {}, happytime() {},
+    midgame(cb) { cb && cb(); },
+    rewarded(cb) { cb && cb(false, 'unavailable'); },
+  });
+
+  // ---------- canvas ----------
+  let canvas, ctx, scale = 1, offX = 0, offY = 0;
+  function resize() {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    const cw = Math.floor(W * scale), ch = Math.floor(H * scale);
+    offX = Math.floor((vw - cw) / 2); offY = Math.floor((vh - ch) / 2);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(cw * dpr); canvas.height = Math.floor(ch * dpr);
+    canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+    canvas.style.left = offX + 'px'; canvas.style.top = offY + 'px';
+    E.pxScale = (cw * dpr) / W;
+    const ui = document.getElementById('ui');
+    ui.style.left = offX + 'px'; ui.style.top = offY + 'px';
+    ui.style.width = W + 'px'; ui.style.height = H + 'px';
+    ui.style.transform = 'scale(' + scale + ')';
+  }
+
+  // ---------- input ----------
+  const keys = new Set(), pressed = new Set();
+  const inp = (E.input = { keys, pressed, mx: W / 2, my: H / 2, mdown: false, mclick: false, touch: false,
+    move: { x: 0, y: 0 }, aimX: W / 2, aimY: H / 2, fire: false, buttons: {} });
+  E.key = (k) => keys.has(k);
+  E.hit = (k) => pressed.has(k);
+  const BLOCK = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' ', 'Space'];
+  window.addEventListener('keydown', (e) => {
+    if (BLOCK.includes(e.key) || BLOCK.includes(e.code)) e.preventDefault();
+    const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    if (!keys.has(k)) pressed.add(k);
+    keys.add(k); inp.touch = false; unlockAudio();
+    if ((k === 'p' || k === 'Escape') && E.state === 'play') E.togglePause();
+    if (k === 'm') E.toggleMute();
+  });
+  window.addEventListener('keyup', (e) => { const k = e.key.length === 1 ? e.key.toLowerCase() : e.key; keys.delete(k); });
+  window.addEventListener('blur', () => { keys.clear(); if (E.state === 'play' && !E.paused) E.togglePause(true); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && E.state === 'play' && !E.paused) E.togglePause(true); });
+
+  function toVirt(cx, cy) { return [(cx - offX) / scale, (cy - offY) / scale]; }
+
+  // Touch: left half = virtual joystick, right half = aim/fire, plus declared buttons.
+  E.touchButtons = []; // {id, label, x, y, r}
+  const stick = { id: null, ox: 0, oy: 0, x: 0, y: 0 };
+  const aimT = { id: null };
+  const btnT = new Map();
+  function btnAt(x, y) { for (const b of E.touchButtons) if (E.dist(x, y, b.x, b.y) < b.r * 1.15) return b; return null; }
+  function onTouch(e) {
+    if (e.target.closest && e.target.closest('#ui .panel, #ui button, .hudbtn')) return;
+    e.preventDefault(); unlockAudio(); inp.touch = true;
+    for (const t of e.changedTouches) {
+      const [x, y] = toVirt(t.clientX, t.clientY);
+      if (e.type === 'touchstart') {
+        const b = btnAt(x, y);
+        if (b) { btnT.set(t.identifier, b.id); inp.buttons[b.id] = true; pressed.add('btn:' + b.id); continue; }
+        if (!E.directTouch && x < W * 0.45 && stick.id === null) { stick.id = t.identifier; stick.ox = x; stick.oy = y; stick.x = x; stick.y = y; }
+        else if (aimT.id === null) { aimT.id = t.identifier; inp.aimX = x; inp.aimY = y; inp.fire = true; inp.mx = x; inp.my = y; inp.mclick = true; }
+      } else if (e.type === 'touchmove') {
+        if (t.identifier === stick.id) { stick.x = x; stick.y = y; }
+        if (t.identifier === aimT.id) { inp.aimX = x; inp.aimY = y; inp.mx = x; inp.my = y; }
+      } else {
+        if (btnT.has(t.identifier)) { inp.buttons[btnT.get(t.identifier)] = false; btnT.delete(t.identifier); }
+        if (t.identifier === stick.id) stick.id = null;
+        if (t.identifier === aimT.id) { aimT.id = null; inp.fire = false; }
+      }
+    }
+  }
+  E.stick = stick;
+
+  function bindPointer() {
+    canvas.addEventListener('mousemove', (e) => { const [x, y] = toVirt(e.clientX, e.clientY); inp.mx = x; inp.my = y; inp.aimX = x; inp.aimY = y; inp.touch = false; });
+    canvas.addEventListener('mousedown', (e) => { unlockAudio(); const [x, y] = toVirt(e.clientX, e.clientY); inp.mx = x; inp.my = y; if (e.button === 2) { inp.rdown = true; pressed.add('mouse2'); } else { inp.mdown = true; inp.mclick = true; } inp.touch = false; });
+    window.addEventListener('mouseup', (e) => { if (e.button === 2) inp.rdown = false; else inp.mdown = false; });
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    ['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach((ev) => canvas.addEventListener(ev, onTouch, { passive: false }));
+  }
+
+  function updateInput() {
+    let mx = 0, my = 0;
+    if (E.key('a') || E.key('ArrowLeft')) mx -= 1;
+    if (E.key('d') || E.key('ArrowRight')) mx += 1;
+    if (E.key('w') || E.key('ArrowUp')) my -= 1;
+    if (E.key('s') || E.key('ArrowDown')) my += 1;
+    if (stick.id !== null) {
+      const dx = stick.x - stick.ox, dy = stick.y - stick.oy, d = Math.hypot(dx, dy), R = 60;
+      if (d > 6) { const m = Math.min(1, d / R); mx = (dx / d) * m; my = (dy / d) * m; }
+      if (d > R) { stick.ox = stick.x - (dx / d) * R; stick.oy = stick.y - (dy / d) * R; }
+    }
+    const l = Math.hypot(mx, my); if (l > 1) { mx /= l; my /= l; }
+    inp.move.x = mx; inp.move.y = my;
+    if (!inp.touch) inp.fire = inp.mdown;
+  }
+
+  E.drawTouch = function (c) {
+    if (!inp.touch) return;
+    c.save();
+    if (stick.id !== null) {
+      c.globalAlpha = 0.25; c.fillStyle = '#fff';
+      c.beginPath(); c.arc(stick.ox, stick.oy, 60, 0, 7); c.fill();
+      c.globalAlpha = 0.5; c.beginPath(); c.arc(stick.x, stick.y, 26, 0, 7); c.fill();
+    } else if (!E.directTouch) {
+      c.globalAlpha = 0.12; c.strokeStyle = '#fff'; c.lineWidth = 3;
+      c.beginPath(); c.arc(120, H - 110, 60, 0, 7); c.stroke();
+    }
+    for (const b of E.touchButtons) {
+      c.globalAlpha = inp.buttons[b.id] ? 0.55 : 0.28; c.fillStyle = b.color || '#fff';
+      c.beginPath(); c.arc(b.x, b.y, b.r, 0, 7); c.fill();
+      c.globalAlpha = 0.9; c.fillStyle = '#000'; c.font = 'bold 16px sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+      c.fillText(b.label, b.x, b.y);
+    }
+    c.restore();
+  };
+
+  // ---------- audio (procedural) ----------
+  let AC = null, master = null, musicBus = null, sfxBus = null;
+  function unlockAudio() {
+    if (!AC) {
+      try {
+        AC = new (window.AudioContext || window.webkitAudioContext)();
+        master = AC.createGain(); master.connect(AC.destination);
+        const comp = AC.createDynamicsCompressor(); comp.connect(master);
+        sfxBus = AC.createGain(); sfxBus.gain.value = 0.5; sfxBus.connect(comp);
+        musicBus = AC.createGain(); musicBus.gain.value = 0.32; musicBus.connect(comp);
+        E.applyVolume();
+        E.onAudio && E.onAudio(AC);
+      } catch (e) { AC = null; }
+    }
+    if (AC && AC.state === 'suspended') AC.resume();
+  }
+  E.audio = () => AC; E.sfxBus = () => sfxBus; E.musicBus = () => musicBus;
+  E.unlockAudio = unlockAudio;
+  E.applyVolume = () => { if (master) master.gain.value = E.muted ? 0 : 1; };
+  E.toggleMute = () => { E.muted = !E.muted; E.save('muted', E.muted); E.applyVolume(); const b = document.getElementById('muteBtn'); if (b) b.textContent = E.muted ? '🔇' : '🔊'; };
+  let noiseBuf = null;
+  function noise() {
+    if (noiseBuf) return noiseBuf;
+    noiseBuf = AC.createBuffer(1, AC.sampleRate * 1, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    return noiseBuf;
+  }
+  // tone(freq, dur, {type, vol, slide, attack, bus, when, filter})
+  E.tone = (f, dur, o = {}) => {
+    if (!AC) return; const t0 = (o.when || AC.currentTime);
+    const osc = AC.createOscillator(), g = AC.createGain();
+    osc.type = o.type || 'square'; osc.frequency.setValueAtTime(f, t0);
+    if (o.slide) osc.frequency.exponentialRampToValueAtTime(Math.max(20, f * o.slide), t0 + dur);
+    const v = o.vol == null ? 0.3 : o.vol, a = o.attack || 0.005;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(v, t0 + a); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    let node = osc;
+    if (o.filter) { const fl = AC.createBiquadFilter(); fl.type = 'lowpass'; fl.frequency.value = o.filter; osc.connect(fl); node = fl; }
+    node.connect(g); g.connect(o.bus || sfxBus); osc.start(t0); osc.stop(t0 + dur + 0.02);
+  };
+  E.noise = (dur, o = {}) => {
+    if (!AC) return; const t0 = (o.when || AC.currentTime);
+    const s = AC.createBufferSource(); s.buffer = noise();
+    const fl = AC.createBiquadFilter(); fl.type = o.ftype || 'lowpass'; fl.frequency.setValueAtTime(o.freq || 2000, t0);
+    if (o.fslide) fl.frequency.exponentialRampToValueAtTime(Math.max(40, (o.freq || 2000) * o.fslide), t0 + dur);
+    const g = AC.createGain(), v = o.vol == null ? 0.3 : o.vol;
+    g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    s.connect(fl); fl.connect(g); g.connect(o.bus || sfxBus); s.start(t0); s.stop(t0 + dur + 0.02);
+  };
+  const lastSfx = {};
+  E.sfx = (name, p = 1) => {
+    if (!AC) return; const now = AC.currentTime;
+    if (lastSfx[name] && now - lastSfx[name] < 0.03) return; lastSfx[name] = now;
+    switch (name) {
+      case 'shoot': E.tone(880 * p, 0.08, { type: 'square', vol: 0.08, slide: 0.5 }); break;
+      case 'laser': E.tone(1400 * p, 0.12, { type: 'sawtooth', vol: 0.07, slide: 0.3 }); break;
+      case 'hit': E.tone(220 * p, 0.07, { type: 'square', vol: 0.12, slide: 0.6 }); E.noise(0.05, { freq: 3000, vol: 0.1 }); break;
+      case 'kill': E.tone(520 * p, 0.12, { type: 'triangle', vol: 0.18, slide: 0.4 }); E.noise(0.15, { freq: 1500, vol: 0.15, fslide: 0.2 }); break;
+      case 'explode': E.noise(0.45, { freq: 1200, vol: 0.4, fslide: 0.1 }); E.tone(90, 0.35, { type: 'sine', vol: 0.4, slide: 0.4 }); break;
+      case 'hurt': E.tone(160, 0.25, { type: 'sawtooth', vol: 0.2, slide: 0.5 }); E.noise(0.2, { freq: 800, vol: 0.2 }); break;
+      case 'pickup': E.tone(660 * p, 0.07, { type: 'triangle', vol: 0.15 }); E.tone(990 * p, 0.1, { type: 'triangle', vol: 0.15, when: now + 0.06 }); break;
+      case 'coin': E.tone(1320 * p, 0.06, { type: 'square', vol: 0.06 }); E.tone(1760 * p, 0.1, { type: 'square', vol: 0.06, when: now + 0.05 }); break;
+      case 'dash': E.noise(0.18, { freq: 600, ftype: 'bandpass', vol: 0.25, fslide: 4 }); break;
+      case 'select': E.tone(520, 0.06, { type: 'square', vol: 0.1 }); E.tone(780, 0.08, { type: 'square', vol: 0.1, when: now + 0.05 }); break;
+      case 'power': [0, 4, 7, 12].forEach((s, i) => E.tone(440 * Math.pow(2, s / 12), 0.15, { type: 'triangle', vol: 0.16, when: now + i * 0.07 })); break;
+      case 'lose': [0, -3, -7, -12].forEach((s, i) => E.tone(330 * Math.pow(2, s / 12), 0.3, { type: 'triangle', vol: 0.2, when: now + i * 0.15 })); break;
+      case 'win': [0, 4, 7, 12, 16].forEach((s, i) => E.tone(523 * Math.pow(2, s / 12), 0.25, { type: 'square', vol: 0.08, when: now + i * 0.08 })); break;
+      case 'blip': E.tone(1000 * p, 0.03, { type: 'sine', vol: 0.1 }); break;
+      case 'thud': E.tone(70 * p, 0.15, { type: 'sine', vol: 0.4, slide: 0.5 }); break;
+      case 'alert': E.tone(880, 0.1, { type: 'square', vol: 0.12 }); E.tone(1175, 0.15, { type: 'square', vol: 0.12, when: now + 0.1 }); break;
+    }
+  };
+
+  // ---------- juice ----------
+  let shakeAmt = 0; E.shake = (a) => { shakeAmt = Math.max(shakeAmt, a); };
+  let hitstop = 0; E.hitstop = (s) => { hitstop = Math.max(hitstop, s); };
+  let flashA = 0, flashC = '#fff'; E.flash = (c, a = 0.4) => { flashC = c; flashA = a; };
+  const parts = (E.parts = []);
+  E.burst = (x, y, color, n = 12, spd = 200, life = 0.5, size = 3, o = {}) => {
+    for (let i = 0; i < n && parts.length < 1200; i++) {
+      const a = o.ang != null ? o.ang + E.rand(-(o.spread || 0.5), o.spread || 0.5) : Math.random() * 6.283;
+      const s = spd * E.rand(0.3, 1);
+      parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: life * E.rand(0.6, 1), max: life, size: size * E.rand(0.6, 1.3), color, drag: o.drag == null ? 3 : o.drag, g: o.g || 0, glow: o.glow });
+    }
+  };
+  const texts = (E.texts = []);
+  E.popText = (x, y, str, color = '#fff', size = 18) => texts.push({ x, y, str, color, size, life: 0.9 });
+  function updateFx(dt) {
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i]; p.life -= dt; if (p.life <= 0) { parts.splice(i, 1); continue; }
+      const k = Math.exp(-p.drag * dt); p.vx *= k; p.vy *= k; p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    }
+    for (let i = texts.length - 1; i >= 0; i--) { const t = texts[i]; t.life -= dt; t.y -= 40 * dt; if (t.life <= 0) texts.splice(i, 1); }
+    shakeAmt *= Math.exp(-10 * dt); if (shakeAmt < 0.3) shakeAmt = 0;
+    flashA *= Math.exp(-8 * dt);
+  }
+  E.drawParts = (c) => {
+    c.save(); c.globalCompositeOperation = 'lighter';
+    for (const p of parts) { c.globalAlpha = Math.max(0, p.life / p.max); c.fillStyle = p.color; const s = p.size; c.fillRect(p.x - s / 2, p.y - s / 2, s, s); }
+    c.restore();
+  };
+  E.drawTexts = (c) => {
+    c.save(); c.textAlign = 'center';
+    for (const t of texts) { c.globalAlpha = Math.min(1, t.life * 2); c.font = 'bold ' + t.size + 'px "Trebuchet MS", sans-serif'; c.fillStyle = '#000'; c.fillText(t.str, t.x + 2, t.y + 2); c.fillStyle = t.color; c.fillText(t.str, t.x, t.y); }
+    c.restore();
+  };
+
+  // ---------- UI overlay ----------
+  E.ui = (html) => { const p = document.getElementById('panel'); if (html == null) { p.style.display = 'none'; p.innerHTML = ''; return p; } p.innerHTML = html; p.style.display = 'flex'; return p; };
+  E.on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', (e) => { e.stopPropagation(); unlockAudio(); E.sfx('select'); fn(e); }); };
+  E.togglePause = (auto) => {
+    if (E.state !== 'play') return;
+    E.paused = !E.paused;
+    if (E.paused) {
+      if (auto !== true) sdk.gameplayStop();
+      E.ui('<h2>Paused</h2><button id="bResume">Resume</button><button id="bQuit" class="sec">Quit to Title</button><p class="hint">P / Esc to resume · M to mute</p>');
+      E.on('bResume', E.togglePause);
+      E.on('bQuit', () => { E.paused = false; E.ui(null); E.game.toTitle(); });
+    } else { E.ui(null); sdk.gameplayStart(); }
+  };
+
+  // ---------- main loop ----------
+  let last = 0;
+  function frame(ts) {
+    requestAnimationFrame(frame);
+    let dt = Math.min(0.033, (ts - last) / 1000 || 0); last = ts;
+    updateInput();
+    if (sdk.adPlaying) dt = 0;
+    const g = E.game;
+    if (hitstop > 0) { hitstop -= dt; dt *= 0.05; }
+    if (!E.paused && !sdk.adPlaying) { E.t += dt; E.dt = dt; g.update(dt); updateFx(dt); }
+    ctx.setTransform(E.pxScale, 0, 0, E.pxScale, 0, 0);
+    ctx.save();
+    if (shakeAmt > 0) ctx.translate(E.rand(-shakeAmt, shakeAmt), E.rand(-shakeAmt, shakeAmt));
+    g.draw(ctx);
+    ctx.restore();
+    if (g.drawHud) g.drawHud(ctx);
+    if (E.state === 'play') E.drawTouch(ctx);
+    if (flashA > 0.01) { ctx.globalAlpha = flashA; ctx.fillStyle = flashC; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+    pressed.clear(); inp.mclick = false;
+  }
+
+  E.start = async (game) => {
+    E.game = game; E.id = game.id;
+    canvas = document.getElementById('c'); ctx = canvas.getContext('2d'); E.ctx = ctx; E.canvas = canvas;
+    E.muted = E.load('muted', false);
+    const mb = document.getElementById('muteBtn'); mb.textContent = E.muted ? '🔇' : '🔊';
+    mb.addEventListener('click', (e) => { e.stopPropagation(); unlockAudio(); E.toggleMute(); });
+    const pb = document.getElementById('pauseBtn');
+    pb.addEventListener('click', (e) => { e.stopPropagation(); E.togglePause(); });
+    window.addEventListener('resize', resize); resize(); bindPointer();
+    E.muted = E.load('muted', false); mb.textContent = E.muted ? '🔇' : '🔊'; E.applyVolume();
+    game.init && game.init();
+    game.toTitle();
+    requestAnimationFrame(frame);
+  };
+  E.setState = (s) => { E.state = s; document.getElementById('pauseBtn').style.display = s === 'play' ? 'block' : 'none'; if (s === 'play') sdk.gameplayStart(); else sdk.gameplayStop(); };
+
+  // helpers for drawing
+  E.glow = (c, color, blur) => { c.shadowColor = color; c.shadowBlur = blur; };
+  E.noGlow = (c) => { c.shadowBlur = 0; };
+  E.bar = (c, x, y, w, h, frac, fg, bg = 'rgba(0,0,0,.5)') => { c.fillStyle = bg; c.fillRect(x, y, w, h); c.fillStyle = fg; c.fillRect(x, y, w * E.clamp(frac, 0, 1), h); };
+  E.text = (c, str, x, y, size = 20, color = '#fff', align = 'left', font = '"Trebuchet MS", sans-serif') => {
+    size = Math.max(size, 13); // stays readable on small screens
+    c.font = 'bold ' + size + 'px ' + font; c.textAlign = align; c.textBaseline = 'alphabetic';
+    c.fillStyle = 'rgba(0,0,0,.6)'; c.fillText(str, x + 2, y + 2); c.fillStyle = color; c.fillText(str, x, y);
+  };
+})();
+
+</script>
+<script>
+// LUMEN SIEGE — wave survival with upgrades. Defend the Lumen Core by weaving light-fences between pylons.
+(function () {
+  const { W, H } = E;
+  const G = { id: 'lumen-siege' };
+  const CX = W / 2, CY = H / 2;
+  let P, core, foes, shots, pylons, shards, wave, waveQ, spawnT, phase, best, stats, stars, banner, bannerT, waveTime;
+
+  function newRun() {
+    P = { x: CX, y: CY + 70, r: 11, speed: 240, rate: 0.2, cd: 0, dmg: 9, twin: 0, down: 0, inv: 0, a: 0, magnet: 70 };
+    core = { hp: 200, max: 200, r: 34, pulse: 0 };
+    stats = { shards: 30, kills: 0, beamDps: 26, beamRange: 250, maxPylons: 3, pylonHp: 60, novaCd: 0, nova: 0 };
+    foes = []; shots = []; pylons = []; shards = []; wave = 0;
+  }
+
+  const SHOP = [
+    { id: 'dmg', n: 'Sharper Photons', d: '+30% drone damage', c: 25, f: () => (P.dmg *= 1.3) },
+    { id: 'rate', n: 'Overclock', d: '+20% fire rate', c: 25, f: () => (P.rate *= 0.83) },
+    { id: 'twin', n: 'Twin Emitters', d: '+1 extra shot', c: 60, f: () => (P.twin += 1), max: 3 },
+    { id: 'beam', n: 'Hot Fences', d: '+35% beam damage', c: 35, f: () => (stats.beamDps *= 1.35) },
+    { id: 'range', n: 'Long Links', d: '+40 link range', c: 30, f: () => (stats.beamRange += 40), max: 5 },
+    { id: 'pylon', n: 'Extra Pylon', d: '+1 max pylon', c: 45, f: () => (stats.maxPylons += 1), max: 6 },
+    { id: 'php', n: 'Hardened Pylons', d: 'Pylons +50% HP, all repaired', c: 25, f: () => { stats.pylonHp *= 1.5; pylons.forEach((p) => (p.hp = p.max = stats.pylonHp)); } },
+    { id: 'repair', n: 'Core Repair', d: 'Restore 80 core HP', c: 20, f: () => (core.hp = Math.min(core.max, core.hp + 80)), always: true },
+    { id: 'cmax', n: 'Core Plating', d: '+60 core max HP', c: 35, f: () => { core.max += 60; core.hp += 60; } },
+    { id: 'speed', n: 'Thrusters', d: '+15% drone speed', c: 20, f: () => (P.speed *= 1.15), max: 4 },
+    { id: 'nova', n: 'Core Nova', d: 'Core blasts nearby foes every few sec', c: 70, f: () => (stats.nova += 1), max: 3 },
+    { id: 'magnet', n: 'Shard Magnet', d: 'Collect shards from afar', c: 15, f: () => (P.magnet += 80), max: 3 },
+  ];
+  let owned = {};
+
+  G.init = () => {
+    best = E.load('best', 0);
+    stars = Array.from({ length: 120 }, () => ({ x: Math.random() * W, y: Math.random() * H, s: Math.random() * 1.6 + 0.3, t: Math.random() * 6 }));
+    E.touchButtons = [{ id: 'pylon', label: 'PYLON', x: W - 90, y: H - 90, r: 44, color: '#64ffda' }];
+    newRun();
+  };
+
+  G.toTitle = () => {
+    E.setState('title'); newRun();
+    for (let i = 0; i < 3; i++) pylons.push(mkPylon(CX + Math.cos(i * 2.1) * 170, CY + Math.sin(i * 2.1) * 140));
+    for (let i = 0; i < 8; i++) spawnFoe('crawler');
+    E.ui(`<h1>LUMEN SIEGE</h1><div class="tag">The dark comes in waves. Weave fences of light to hold it back.</div>
+      <button id="bPlay">Defend the Core</button>
+      <p class="hint">Move: WASD · Aim+Shoot: Mouse · Place pylon: E / Space / Right-click<br>Pylons link to each other and the Core with damaging light beams.<br>Touch: stick to move, tap right side to aim & fire, PYLON button to build</p>
+      <p class="hint">Best wave: ${best}</p>`);
+    E.on('bPlay', () => { newRun(); owned = {}; E.ui(null); startWave(); });
+  };
+
+  function mkPylon(x, y) { return { x, y, hp: stats.pylonHp, max: stats.pylonHp, t: 0, r: 10 }; }
+
+  function startWave() {
+    wave++; phase = 'wave'; waveTime = 0;
+    const isBoss = wave % 5 === 0;
+    waveQ = [];
+    const n = 6 + wave * 3;
+    for (let i = 0; i < n; i++) {
+      const pool = ['crawler', 'crawler'];
+      if (wave >= 2) pool.push('dasher');
+      if (wave >= 3) pool.push('splitter');
+      if (wave >= 4) pool.push('stalker');
+      if (wave >= 6) pool.push('tank');
+      waveQ.push(E.pick(pool));
+    }
+    if (isBoss) waveQ.splice(Math.floor(waveQ.length / 2), 0, 'maw');
+    spawnT = 1;
+    banner = isBoss ? 'WAVE ' + wave + ' · THE MAW RISES' : 'WAVE ' + wave; bannerT = 2;
+    E.sfx('alert'); E.setState('play');
+  }
+
+  function edgePoint() {
+    const s = E.randi(0, 3), m = 30;
+    return s === 0 ? [E.rand(0, W), -m] : s === 1 ? [W + m, E.rand(0, H)] : s === 2 ? [E.rand(0, W), H + m] : [-m, E.rand(0, H)];
+  }
+
+  function spawnFoe(type, at) {
+    const k = 1 + (wave || 1) * 0.14;
+    const T = {
+      crawler: { r: 11, hp: 20, spd: 55, col: '#7c4dff', dmg: 8, sh: 2 },
+      dasher: { r: 9, hp: 14, spd: 40, col: '#ff4081', dmg: 6, sh: 2 },
+      splitter: { r: 15, hp: 40, spd: 42, col: '#00b0ff', dmg: 10, sh: 4 },
+      mini: { r: 7, hp: 10, spd: 80, col: '#40c4ff', dmg: 4, sh: 1 },
+      stalker: { r: 10, hp: 24, spd: 95, col: '#ffab40', dmg: 10, sh: 3 },
+      tank: { r: 22, hp: 160, spd: 26, col: '#b0bec5', dmg: 25, sh: 8 },
+      maw: { r: 48, hp: 1400, spd: 18, col: '#d500f9', dmg: 60, sh: 60 },
+    }[type];
+    const [x, y] = at || edgePoint();
+    const f = { type, x, y, r: T.r, hp: T.hp * k, max: T.hp * k, spd: T.spd * (1 + (wave || 1) * 0.02), col: T.col, dmg: T.dmg, sh: T.sh, t: Math.random() * 5, flash: 0, st: E.rand(1, 3), vx: 0, vy: 0 };
+    if (type === 'maw') { f.hp = f.max = 1400 * (1 + (wave / 5 - 1) * 0.9); }
+    foes.push(f); return f;
+  }
+
+  // segments: pylon-pylon and pylon-core within range
+  function links() {
+    const L = [], R = stats.beamRange;
+    for (let i = 0; i < pylons.length; i++) {
+      const a = pylons[i];
+      if (E.dist(a.x, a.y, CX, CY) < R) L.push([a.x, a.y, CX, CY]);
+      for (let j = i + 1; j < pylons.length; j++) { const b = pylons[j]; if (E.dist(a.x, a.y, b.x, b.y) < R) L.push([a.x, a.y, b.x, b.y]); }
+    }
+    return L;
+  }
+  function segDist(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1, l2 = dx * dx + dy * dy;
+    let t = l2 ? ((px - x1) * dx + (py - y1) * dy) / l2 : 0; t = E.clamp(t, 0, 1);
+    return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+  }
+
+  function placePylon() {
+    if (P.down > 0) return;
+    if (E.dist(P.x, P.y, CX, CY) < core.r + 20 || pylons.some((p) => E.dist(p.x, p.y, P.x, P.y) < 30)) { E.popText(P.x, P.y - 20, 'Too close', '#ff8a80', 14); return; }
+    if (pylons.length >= stats.maxPylons) {
+      // recycle oldest pylon
+      const old = pylons.shift(); E.burst(old.x, old.y, '#64ffda', 12, 150, 0.4, 3);
+    }
+    const cost = 0;
+    pylons.push(mkPylon(P.x, P.y)); E.sfx('power'); E.burst(P.x, P.y, '#64ffda', 20, 200, 0.5, 3);
+    return cost;
+  }
+
+  function hitFoe(f, d) {
+    f.hp -= d; f.flash = 0.08;
+    if (f.hp <= 0 && !f.dead) {
+      f.dead = true; stats.kills++; E.sfx('kill', E.rand(0.8, 1.3)); E.burst(f.x, f.y, f.col, f.type === 'maw' ? 150 : 16, f.type === 'maw' ? 500 : 220, 0.6, 4);
+      E.shake(f.type === 'maw' ? 25 : f.type === 'tank' ? 7 : 2);
+      for (let i = 0; i < Math.ceil(f.sh / 2); i++) shards.push({ x: f.x, y: f.y, vx: E.rand(-100, 100), vy: E.rand(-100, 100), v: Math.min(2, f.sh), t: 0 });
+      if (f.type === 'splitter') for (let i = 0; i < 3; i++) spawnFoe('mini', [f.x + E.rand(-10, 10), f.y + E.rand(-10, 10)]);
+      if (f.type === 'maw') { E.sdk.happytime(); E.flash('#fff', 0.6); E.hitstop(0.25); }
+    }
+  }
+
+  G.update = (dt) => {
+    for (const s of stars) s.t += dt;
+    if (bannerT > 0) bannerT -= dt;
+    core.pulse += dt;
+    if (E.state === 'title') { for (const f of foes) { const a = E.angTo(f.x, f.y, CX, CY); f.x += Math.cos(a) * 40 * dt; f.y += Math.sin(a) * 40 * dt; f.t += dt; if (E.dist(f.x, f.y, CX, CY) < 120) { const [x, y] = edgePoint(); f.x = x; f.y = y; } } return; }
+    if (E.state !== 'play') return;
+    waveTime += dt;
+    // spawn
+    if (phase === 'wave' && waveQ.length) {
+      spawnT -= dt;
+      if (spawnT <= 0) { const t = waveQ.shift(); spawnFoe(t); spawnT = Math.max(0.25, 1.3 - wave * 0.06) * E.rand(0.5, 1.2); if (t === 'maw') { E.sfx('explode'); E.shake(10); } }
+    }
+    // player
+    P.inv -= dt; P.cd -= dt;
+    if (P.down > 0) { P.down -= dt; P.x = E.lerp(P.x, CX, dt * 3); P.y = E.lerp(P.y, CY + 60, dt * 3); if (P.down <= 0) { P.inv = 1.5; E.sfx('power'); } }
+    else {
+      const m = E.input.move; P.x = E.clamp(P.x + m.x * P.speed * dt, 12, W - 12); P.y = E.clamp(P.y + m.y * P.speed * dt, 12, H - 12);
+      P.a = E.angTo(P.x, P.y, E.input.aimX, E.input.aimY);
+      if (E.input.fire && P.cd <= 0) {
+        P.cd = P.rate; const n = 1 + P.twin;
+        for (let i = 0; i < n; i++) { const a = P.a + (i - (n - 1) / 2) * 0.12; shots.push({ x: P.x, y: P.y, vx: Math.cos(a) * 640, vy: Math.sin(a) * 640, life: 0.9 }); }
+        E.sfx('shoot', 1.3);
+      }
+      if (E.hit('e') || E.hit(' ') || E.hit('mouse2') || E.hit('btn:pylon')) placePylon();
+      if (Math.random() < 0.6) E.burst(P.x - Math.cos(P.a) * 10, P.y - Math.sin(P.a) * 10, '#64ffda', 1, 50, 0.3, 2);
+    }
+    // nova
+    if (stats.nova) {
+      stats.novaCd -= dt;
+      if (stats.novaCd <= 0) {
+        const R = 110 + stats.nova * 30; let any = false;
+        for (const f of foes) if (!f.dead && E.dist(f.x, f.y, CX, CY) < R) { hitFoe(f, 30 * stats.nova * (1 + wave * 0.1)); any = true; }
+        if (any) { stats.novaCd = 4 - stats.nova * 0.6; E.burst(CX, CY, '#e0f7fa', 60, R * 3, 0.4, 3); E.sfx('explode'); E.shake(5); core.nova = 0.3; }
+      }
+    }
+    if (core.nova > 0) core.nova -= dt;
+    // shots
+    for (let i = shots.length - 1; i >= 0; i--) {
+      const s = shots[i]; s.x += s.vx * dt; s.y += s.vy * dt; s.life -= dt;
+      let hit = false;
+      for (const f of foes) if (!f.dead && E.dist(s.x, s.y, f.x, f.y) < f.r + 4) { hitFoe(f, P.dmg); E.sfx('hit', 1.4); E.burst(s.x, s.y, '#a7ffeb', 4, 120, 0.2, 2); f.x += s.vx * 0.008 * (f.type === 'maw' ? 0 : 1); f.y += s.vy * 0.008 * (f.type === 'maw' ? 0 : 1); hit = true; break; }
+      if (hit || s.life <= 0) shots.splice(i, 1);
+    }
+    // beams
+    const L = links();
+    for (const f of foes) {
+      if (f.dead) continue;
+      for (const l of L) if (segDist(f.x, f.y, l[0], l[1], l[2], l[3]) < f.r + 3) { hitFoe(f, stats.beamDps * dt); if (Math.random() < 0.3) E.burst(f.x, f.y, '#64ffda', 1, 100, 0.3, 2); f.zap = 0.1; }
+    }
+    // foes
+    for (const f of foes) {
+      if (f.dead) continue;
+      f.t += dt; f.flash -= dt; f.zap = (f.zap || 0) - dt;
+      // target: stalker targets drone; others the nearest of core/pylons
+      let tx = CX, ty = CY, tr = core.r, tgt = core;
+      if (f.type === 'stalker' && P.down <= 0) { tx = P.x; ty = P.y; tr = P.r; tgt = P; }
+      else { for (const p of pylons) if (E.dist(f.x, f.y, p.x, p.y) < Math.min(130, E.dist(f.x, f.y, tx, ty))) { tx = p.x; ty = p.y; tr = p.r; tgt = p; } }
+      const a = E.angTo(f.x, f.y, tx, ty), d = E.dist(f.x, f.y, tx, ty);
+      let spd = f.spd;
+      if (f.type === 'dasher') { f.st -= dt; if (f.st < 0.35) spd = 330; if (f.st <= 0) f.st = E.rand(1.2, 2); }
+      if (f.type === 'crawler') { const w = Math.sin(f.t * 3) * 0.5; f.x += Math.cos(a + w) * spd * dt; f.y += Math.sin(a + w) * spd * dt; }
+      else { f.x += Math.cos(a) * spd * dt; f.y += Math.sin(a) * spd * dt; }
+      if (d < f.r + tr) {
+        if (tgt === core) { core.hp -= f.dmg; E.shake(6); E.flash('#d500f9', 0.15); E.sfx('hurt'); f.dead = true; E.burst(f.x, f.y, f.col, 20, 200, 0.5, 3); if (f.type === 'maw') core.hp -= 40; }
+        else if (tgt === P) { if (P.inv <= 0) { P.down = 3; E.sfx('hurt'); E.shake(8); E.burst(P.x, P.y, '#64ffda', 30, 260, 0.6, 3); } f.dead = true; E.burst(f.x, f.y, f.col, 10, 150, 0.4, 3); }
+        else { tgt.hp -= f.dmg; tgt.hitT = 0.15; E.sfx('thud'); f.dead = f.type !== 'maw' && f.type !== 'tank'; if (!f.dead) { f.x -= Math.cos(a) * 30; f.y -= Math.sin(a) * 30; } E.burst(f.x, f.y, f.col, 10, 150, 0.4, 3); }
+      }
+      // drone body contact damages small foes too
+      if (P.down <= 0 && P.inv <= 0 && f.type !== 'stalker' && E.dist(f.x, f.y, P.x, P.y) < f.r + P.r) { P.down = 3; E.sfx('hurt'); E.shake(8); E.burst(P.x, P.y, '#64ffda', 30, 260, 0.6, 3); }
+    }
+    foes = foes.filter((f) => !f.dead);
+    for (let i = pylons.length - 1; i >= 0; i--) { const p = pylons[i]; p.t += dt; p.hitT = (p.hitT || 0) - dt; if (p.hp <= 0) { E.burst(p.x, p.y, '#64ffda', 30, 240, 0.6, 3); E.sfx('explode'); E.shake(6); pylons.splice(i, 1); } }
+    // shards
+    for (let i = shards.length - 1; i >= 0; i--) {
+      const s = shards[i]; s.t += dt; const d = E.dist(s.x, s.y, P.x, P.y);
+      if (s.t > 0.3 && (d < P.magnet || phase === 'clear')) { const a = E.angTo(s.x, s.y, P.x, P.y); s.vx = Math.cos(a) * 520; s.vy = Math.sin(a) * 520; }
+      s.vx *= Math.exp(-2.5 * dt); s.vy *= Math.exp(-2.5 * dt); s.x += s.vx * dt; s.y += s.vy * dt;
+      if (d < P.r + 8) { stats.shards += s.v; E.sfx('coin', E.rand(1, 1.3)); shards.splice(i, 1); }
+      else if (s.t > 14) shards.splice(i, 1);
+    }
+    if (core.hp <= 0) return gameOver();
+    if (phase === 'wave' && !waveQ.length && !foes.length) {
+      phase = 'clear'; E.sfx('win'); banner = 'WAVE CLEARED'; bannerT = 1.5;
+      const bonus = 10 + wave * 3; stats.shards += bonus; E.popText(CX, CY - 60, '+' + bonus + ' shards', '#64ffda', 22);
+      setTimeout(() => { for (const s of shards) stats.shards += s.v; shards = []; if (wave % 5 === 0) { E.setState('menu'); E.sdk.midgame(openShop); } else openShop(); }, 1400);
+    }
+  };
+
+  function gameOver() {
+    E.setState('over'); E.sfx('lose'); E.shake(20); E.burst(CX, CY, '#e040fb', 120, 500, 1.2, 4);
+    if (wave > best) { best = wave; E.save('best', best); }
+    setTimeout(() => E.sdk.midgame(() => {
+      E.ui(`<h2>The Core has fallen</h2><div class="stats">Survived to wave <b>${wave}</b> · Shadows purged <b>${stats.kills}</b><br>Best wave: <b>${best}</b></div>
+      <button id="bAgain">Rekindle the Core</button><button id="bMenu" class="sec">Title</button>`);
+      E.on('bAgain', () => { newRun(); owned = {}; E.ui(null); startWave(); }); E.on('bMenu', G.toTitle);
+    }), 1100);
+  }
+
+  let offer = [];
+  function openShop() {
+    E.setState('menu');
+    const pool = E.shuffle(SHOP.filter((s) => !s.always && (!s.max || (owned[s.id] || 0) < s.max))).slice(0, 4);
+    offer = [SHOP.find((s) => s.id === 'repair'), ...pool];
+    renderShop();
+  }
+  function cost(s) { return Math.round(s.c * Math.pow(1.35, owned[s.id] || 0)); }
+  function renderShop() {
+    const cards = offer.map((s, i) => { const c = cost(s), can = stats.shards >= c && !(s.max && (owned[s.id] || 0) >= s.max);
+      return `<div class="card" id="s${i}" style="width:160px;min-height:130px;${can ? '' : 'opacity:.45'}"><b>${s.n}</b><span>${s.d}</span><span style="margin-top:auto;color:#64ffda;font-weight:bold">◆ ${c}</span></div>`; }).join('');
+    E.ui(`<h2>Wave ${wave} survived</h2><p>◆ <b>${stats.shards}</b> shards · Core ${Math.ceil(core.hp)}/${core.max} · Pylons ${pylons.length}/${stats.maxPylons}</p>
+      <div class="row">${cards}</div><button id="bNext">Start Wave ${wave + 1}</button><p class="hint">Tip: chain pylons into a ring around the Core — every link is a damaging fence.</p>`);
+    offer.forEach((s, i) => {
+      const el = document.getElementById('s' + i);
+      el.addEventListener('click', () => { E.unlockAudio(); const c = cost(s); if (stats.shards < c || (s.max && (owned[s.id] || 0) >= s.max)) { E.sfx('hurt'); return; } stats.shards -= c; s.f(); owned[s.id] = (owned[s.id] || 0) + 1; E.sfx('power'); renderShop(); });
+    });
+    E.on('bNext', () => { E.ui(null); startWave(); });
+  }
+
+  // ---------- draw ----------
+  G.draw = (c) => {
+    const g = c.createRadialGradient(CX, CY, 20, CX, CY, 600); g.addColorStop(0, '#0d1b2a'); g.addColorStop(1, '#03050b');
+    c.fillStyle = g; c.fillRect(0, 0, W, H);
+    for (const s of stars) { c.globalAlpha = 0.4 + Math.sin(s.t * 2) * 0.3; c.fillStyle = '#cfe8ff'; c.fillRect(s.x, s.y, s.s, s.s); }
+    c.globalAlpha = 1;
+    // range hint
+    if (E.state === 'play' && P.down <= 0) { c.strokeStyle = 'rgba(100,255,218,.08)'; c.setLineDash([6, 8]); c.beginPath(); c.arc(P.x, P.y, stats.beamRange, 0, 7); c.stroke(); c.setLineDash([]); }
+    // beams
+    c.save(); c.globalCompositeOperation = 'lighter';
+    for (const l of links()) {
+      const fl = 0.7 + Math.sin(E.t * 30 + l[0]) * 0.3;
+      c.strokeStyle = 'rgba(100,255,218,' + 0.25 * fl + ')'; c.lineWidth = 10; c.beginPath(); c.moveTo(l[0], l[1]); c.lineTo(l[2], l[3]); c.stroke();
+      c.strokeStyle = 'rgba(220,255,250,' + 0.9 * fl + ')'; c.lineWidth = 2.5; c.beginPath(); c.moveTo(l[0], l[1]); c.lineTo(l[2], l[3]); c.stroke();
+    }
+    c.restore();
+    // core
+    const pr = core.r + Math.sin(core.pulse * 3) * 3;
+    c.save(); E.glow(c, '#64ffda', 40);
+    c.fillStyle = core.hp / core.max < 0.3 ? '#ff80ab' : '#a7ffeb'; c.beginPath(); c.arc(CX, CY, pr, 0, 7); c.fill();
+    c.fillStyle = '#fff'; c.beginPath(); c.arc(CX, CY, pr * 0.5, 0, 7); c.fill(); E.noGlow(c);
+    c.strokeStyle = 'rgba(167,255,235,.5)'; c.lineWidth = 3;
+    for (let i = 0; i < 3; i++) { c.beginPath(); c.arc(CX, CY, pr + 10 + i * 6, core.pulse * (i + 1) * 0.8, core.pulse * (i + 1) * 0.8 + 2.2); c.stroke(); }
+    if (core.nova > 0) { c.strokeStyle = 'rgba(255,255,255,' + core.nova * 3 + ')'; c.lineWidth = 6; c.beginPath(); c.arc(CX, CY, (1 - core.nova / 0.3) * (110 + stats.nova * 30), 0, 7); c.stroke(); }
+    c.restore();
+    E.bar(c, CX - 40, CY + core.r + 22, 80, 6, core.hp / core.max, '#64ffda');
+    // pylons
+    for (const p of pylons) {
+      c.save(); c.translate(p.x, p.y);
+      c.fillStyle = p.hitT > 0 ? '#fff' : '#1de9b6'; E.glow(c, '#1de9b6', 16);
+      c.beginPath(); c.moveTo(0, -14); c.lineTo(9, 0); c.lineTo(0, 14); c.lineTo(-9, 0); c.closePath(); c.fill(); E.noGlow(c);
+      c.fillStyle = '#e0fff8'; c.beginPath(); c.arc(0, 0, 3 + Math.sin(p.t * 6), 0, 7); c.fill();
+      c.restore();
+      if (p.hp < p.max) E.bar(c, p.x - 12, p.y + 18, 24, 3, p.hp / p.max, '#1de9b6');
+    }
+    // shards
+    for (const s of shards) { c.fillStyle = '#64ffda'; c.save(); c.translate(s.x, s.y); c.rotate(s.t * 4); c.fillRect(-3, -3, 6, 6); c.restore(); }
+    // foes
+    for (const f of foes) drawFoe(c, f);
+    // shots
+    c.save(); c.globalCompositeOperation = 'lighter'; c.strokeStyle = '#a7ffeb'; c.lineWidth = 3;
+    for (const s of shots) { c.beginPath(); c.moveTo(s.x, s.y); c.lineTo(s.x - s.vx * 0.02, s.y - s.vy * 0.02); c.stroke(); }
+    c.restore();
+    // drone
+    if (E.state !== 'title') {
+      c.save(); c.translate(P.x, P.y); c.rotate(P.a);
+      c.globalAlpha = P.down > 0 ? 0.35 : P.inv > 0 && Math.floor(P.inv * 15) % 2 ? 0.4 : 1;
+      E.glow(c, '#64ffda', 14); c.fillStyle = '#e0f2f1';
+      c.beginPath(); c.moveTo(14, 0); c.lineTo(-9, -10); c.lineTo(-4, 0); c.lineTo(-9, 10); c.closePath(); c.fill(); E.noGlow(c);
+      c.restore();
+      if (P.down > 0) E.text(c, 'REBOOT ' + P.down.toFixed(1), P.x, P.y - 20, 12, '#ff80ab', 'center');
+    }
+    E.drawParts(c); E.drawTexts(c);
+  };
+
+  function drawFoe(c, f) {
+    c.save(); c.translate(f.x, f.y);
+    const col = f.flash > 0 ? '#fff' : f.col;
+    E.glow(c, f.col, 12); c.fillStyle = col;
+    const t = f.t;
+    if (f.type === 'crawler' || f.type === 'mini') {
+      c.beginPath(); for (let i = 0; i < 8; i++) { const a = (i / 8) * 6.283, r = f.r * (i % 2 ? 0.6 : 1) * (1 + Math.sin(t * 8 + i) * 0.1); c.lineTo(Math.cos(a + t) * r, Math.sin(a + t) * r); } c.closePath(); c.fill();
+    } else if (f.type === 'dasher') {
+      c.rotate(E.angTo(f.x, f.y, CX, CY)); c.beginPath(); c.moveTo(f.r * 1.6, 0); c.lineTo(-f.r, -f.r); c.lineTo(-f.r, f.r); c.closePath(); c.fill();
+    } else if (f.type === 'splitter') {
+      for (let i = 0; i < 3; i++) { const a = t * 2 + i * 2.09; c.beginPath(); c.arc(Math.cos(a) * 6, Math.sin(a) * 6, 9, 0, 7); c.fill(); }
+    } else if (f.type === 'stalker') {
+      c.rotate(E.angTo(f.x, f.y, P.x, P.y)); c.beginPath(); c.moveTo(14, 0); c.lineTo(-6, -9); c.lineTo(-2, 0); c.lineTo(-6, 9); c.closePath(); c.fill();
+    } else if (f.type === 'tank') {
+      c.rotate(t * 0.5); c.beginPath(); for (let i = 0; i < 6; i++) { const a = (i / 6) * 6.283; c.lineTo(Math.cos(a) * f.r, Math.sin(a) * f.r); } c.closePath(); c.fill();
+      c.fillStyle = '#37474f'; c.beginPath(); c.arc(0, 0, f.r * 0.5, 0, 7); c.fill();
+    } else if (f.type === 'maw') {
+      const open = 0.3 + Math.abs(Math.sin(t * 2)) * 0.6, a = E.angTo(f.x, f.y, CX, CY);
+      c.rotate(a); c.beginPath(); c.arc(0, 0, f.r, open, 6.283 - open); c.lineTo(0, 0); c.closePath(); c.fill();
+      c.fillStyle = '#fff'; c.beginPath(); c.arc(-10, -f.r * 0.5, 7, 0, 7); c.fill(); c.fillStyle = '#000'; c.beginPath(); c.arc(-8, -f.r * 0.5, 3, 0, 7); c.fill();
+    }
+    E.noGlow(c);
+    c.fillStyle = '#fff'; if (f.type !== 'maw' && f.type !== 'tank') { c.fillRect(-3, -2, 2, 2); c.fillRect(2, -2, 2, 2); }
+    c.restore();
+    if (f.zap > 0) { c.strokeStyle = '#e0fff8'; c.lineWidth = 1; c.beginPath(); c.arc(f.x, f.y, f.r + 4, 0, 7); c.stroke(); }
+    if (f.type === 'maw' || f.type === 'tank') E.bar(c, f.x - f.r, f.y - f.r - 10, f.r * 2, 4, f.hp / f.max, '#ea80fc');
+  }
+
+  G.drawHud = (c) => {
+    if (E.state === 'title') return;
+    E.text(c, 'WAVE ' + wave, 20, 34, 22, '#64ffda');
+    E.text(c, '◆ ' + stats.shards, 20, 60, 18, '#a7ffeb');
+    E.text(c, 'PYLONS ' + pylons.length + '/' + stats.maxPylons, 20, 84, 14, '#80cbc4');
+    E.text(c, 'CORE', W / 2 - 150, 26, 14, '#a7ffeb', 'right');
+    E.bar(c, W / 2 - 140, 14, 280, 14, core.hp / core.max, core.hp / core.max < 0.3 ? '#ff4081' : '#1de9b6');
+    if (phase === 'wave') { const left = waveQ.length + foes.length; E.text(c, left + ' shadows left', W / 2, 48, 14, '#b2dfdb', 'center'); }
+    if (bannerT > 0) { c.globalAlpha = Math.min(1, bannerT); E.text(c, banner, W / 2, H / 2 - 90, 40, '#e0fff8', 'center'); c.globalAlpha = 1; }
+    if (wave === 1 && waveTime < 8 && E.state === 'play') E.text(c, E.input.touch ? 'Tap PYLON to drop pylons. Link them to the Core!' : 'Press E / Space / Right-click to drop pylons. Link them to the Core!', W / 2, H - 24, 16, '#ffffff', 'center');
+  };
+
+  G._dbg = { s: () => ({ foes, P, core, stats, wave, phase, pylons }), killAll: () => { waveQ = []; foes.forEach((f) => (f.dead = true)); }, setWave: (w) => (wave = w) };
+  E.start(G);
+})();
+
+</script>
+</body>
+</html>

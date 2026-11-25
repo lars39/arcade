@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>ECHO STEP</title>
+<style>html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0b0f1a;touch-action:none;-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+canvas{position:absolute;display:block;image-rendering:auto}</style></head>
+<body><canvas id="c"></canvas>
+<script>
+/* ===== Shared micro-engine (inlined into each game at build time) =====
+   Logical resolution 960x540, letterboxed. Handles: (no platform SDK,
+   loaded async with offline fallback), input (keys/mouse/touch + virtual
+   buttons), procedural audio, juice (shake/particles/flash/hitstop/popups),
+   title/pause/gameover flow, best-score storage. */
+(function () {
+  'use strict';
+  const W = 960, H = 540;
+  const E = (window.Engine = { W, H, t: 0, state: 'boot' });
+
+  /* ---------- storage ---------- */
+  // Progress (best scores, unlocked levels, mute) is saved in the browser's localStorage.
+  E.load = (k, d) => { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } };
+  E.save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+
+  /* ---------- math helpers ---------- */
+  E.rand = (a, b) => a + Math.random() * (b - a);
+  E.randi = (a, b) => Math.floor(E.rand(a, b + 1));
+  E.clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  E.lerp = (a, b, t) => a + (b - a) * t;
+  E.pick = (arr) => arr[(Math.random() * arr.length) | 0];
+  E.dist = (ax, ay, bx, by) => Math.hypot(bx - ax, by - ay);
+  E.aabb = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  /* ---------- game-flow hooks (no platform SDK; kept so game code can call them) ---------- */
+  const SDK = (E.sdk = { start() {}, stop() {}, happy() {}, midgame(cb) { cb && cb(); } });
+
+  /* ---------- canvas ---------- */
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  E.ctx = ctx; E.canvas = canvas;
+  let scale = 1, offX = 0, offY = 0, dpr = 1;
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const vw = window.innerWidth, vh = window.innerHeight;
+    scale = Math.min(vw / W, vh / H);
+    const cw = Math.floor(W * scale), ch = Math.floor(H * scale);
+    offX = (vw - cw) / 2; offY = (vh - ch) / 2;
+    canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
+    canvas.style.left = offX + 'px'; canvas.style.top = offY + 'px';
+    canvas.width = Math.floor(cw * dpr); canvas.height = Math.floor(ch * dpr);
+  }
+  window.addEventListener('resize', resize); resize();
+
+  /* ---------- input ---------- */
+  const keys = {}, pressed = {}, uiPressed = {};
+  E.uiHit = (...ks) => ks.some((k) => uiPressed[k]);
+  E.press = (k) => { pressed[k] = true; }; // used by automated tests
+  E.clearPressed = () => { for (const k in pressed) delete pressed[k]; };
+  E.inUI = (x, y) => y < 56 && x > W - 110;
+  E.keys = keys;
+  E.down = (...ks) => ks.some((k) => keys[k]);
+  E.hit = (...ks) => ks.some((k) => pressed[k]);
+  const BLOCK = ['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+  window.addEventListener('keydown', (e) => {
+    if (BLOCK.includes(e.code)) e.preventDefault();
+    Audio.unlock(); E.touchMode = false;
+    if (!keys[e.code]) { pressed[e.code] = true; uiPressed[e.code] = true; }
+    keys[e.code] = true;
+  });
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+  window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; if (E.state === 'play') E.pause(true); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && E.state === 'play') E.pause(true); });
+
+  const ptr = (E.pointer = { x: W / 2, y: H / 2, down: false, clicked: false, released: false });
+  const toLogical = (cx, cy) => [(cx - offX) / scale, (cy - offY) / scale];
+  E.touchButtons = []; // {key,label,x,y,r}
+  const activeTouches = new Map(); // id -> key | 'ptr'
+  function btnAt(x, y) {
+    for (const b of E.touchButtons) if ((x - b.x) ** 2 + (y - b.y) ** 2 < (b.r * 1.25) ** 2) return b;
+    return null;
+  }
+  canvas.addEventListener('mousedown', (e) => {
+    Audio.unlock(); E.touchMode = false;
+    [ptr.x, ptr.y] = toLogical(e.clientX, e.clientY);
+    ptr.down = true; ptr.clicked = true; ptr.uiClick = true; ptr.button = e.button;
+  });
+  window.addEventListener('mousemove', (e) => { [ptr.x, ptr.y] = toLogical(e.clientX, e.clientY); });
+  window.addEventListener('mouseup', () => { if (ptr.down) ptr.released = true; ptr.down = false; });
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  function tstart(e) {
+    e.preventDefault(); Audio.unlock(); E.touchMode = true;
+    for (const t of e.changedTouches) {
+      const [x, y] = toLogical(t.clientX, t.clientY);
+      const b = E.state === 'play' ? btnAt(x, y) : null;
+      if (b) { activeTouches.set(t.identifier, b.key); if (!keys[b.key]) { pressed[b.key] = true; uiPressed[b.key] = true; } keys[b.key] = true; }
+      else { activeTouches.set(t.identifier, 'ptr'); ptr.x = x; ptr.y = y; ptr.down = true; ptr.clicked = true; ptr.uiClick = true; }
+    }
+  }
+  function tmove(e) {
+    e.preventDefault();
+    for (const t of e.changedTouches) if (activeTouches.get(t.identifier) === 'ptr') [ptr.x, ptr.y] = toLogical(t.clientX, t.clientY);
+  }
+  function tend(e) {
+    e.preventDefault(); Audio.unlock();
+    for (const t of e.changedTouches) {
+      const k = activeTouches.get(t.identifier);
+      activeTouches.delete(t.identifier);
+      if (k === 'ptr') { if (![...activeTouches.values()].includes('ptr')) { ptr.down = false; ptr.released = true; } }
+      else if (k && ![...activeTouches.values()].includes(k)) keys[k] = false;
+    }
+  }
+  canvas.addEventListener('touchstart', tstart, { passive: false });
+  canvas.addEventListener('touchmove', tmove, { passive: false });
+  canvas.addEventListener('touchend', tend, { passive: false });
+  canvas.addEventListener('touchcancel', tend, { passive: false });
+  E.touchMode = 'ontouchstart' in window && navigator.maxTouchPoints > 0 && !matchMedia('(pointer:fine)').matches;
+
+  /* ---------- audio (procedural) ---------- */
+  const Audio = (E.audio = { ctx: null, master: null, userMuted: E.load('mute_' + document.title, false) });
+  Audio.unlock = function () {
+    try {
+      if (!Audio.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+        Audio.ctx = new AC(); Audio.master = Audio.ctx.createGain(); Audio.master.connect(Audio.ctx.destination);
+        Audio.apply();
+      }
+      if (Audio.ctx.state === 'suspended') Audio.ctx.resume();
+    } catch (e) {}
+  };
+  Audio.isMuted = () => Audio.userMuted;
+  Audio.apply = () => { if (Audio.master) Audio.master.gain.value = Audio.isMuted() ? 0 : 0.5; };
+  Audio.toggle = () => { Audio.userMuted = !Audio.userMuted; E.save('mute_' + document.title, Audio.userMuted); Audio.apply(); };
+  /* tone(freq, dur, type, vol, slideTo, delay) */
+  E.tone = function (f, d = 0.1, type = 'square', v = 0.2, slide = 0, delay = 0) {
+    const a = Audio.ctx; if (!a || Audio.isMuted()) return;
+    const t0 = a.currentTime + delay, o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t0);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(20, slide), t0 + d);
+    g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + d);
+    o.connect(g); g.connect(Audio.master); o.start(t0); o.stop(t0 + d + 0.02);
+  };
+  let noiseBuf = null;
+  E.noise = function (d = 0.2, v = 0.3, freq = 1200, delay = 0) {
+    const a = Audio.ctx; if (!a || Audio.isMuted()) return;
+    if (!noiseBuf) { noiseBuf = a.createBuffer(1, a.sampleRate, a.sampleRate); const ch = noiseBuf.getChannelData(0); for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1; }
+    const t0 = a.currentTime + delay, s = a.createBufferSource(), f = a.createBiquadFilter(), g = a.createGain();
+    s.buffer = noiseBuf; f.type = 'lowpass'; f.frequency.value = freq;
+    g.gain.setValueAtTime(v, t0); g.gain.exponentialRampToValueAtTime(0.001, t0 + d);
+    s.connect(f); f.connect(g); g.connect(Audio.master); s.start(t0); s.stop(t0 + d + 0.05);
+  };
+  /* simple generative music: scale + bass, scheduled ahead */
+  const Music = (E.music = { on: false, step: 0, next: 0, bpm: 120, scale: [0, 3, 5, 7, 10], root: 220, pattern: null });
+  Music.start = (opts) => { Object.assign(Music, opts || {}); Music.on = true; Music.step = 0; Music.next = Audio.ctx ? Audio.ctx.currentTime + 0.05 : 0; };
+  Music.stop = () => { Music.on = false; };
+  function musicTick() {
+    const a = Audio.ctx; if (!a || !Music.on || Audio.isMuted()) { if (a) Music.next = a.currentTime + 0.05; return; }
+    const spb = 60 / Music.bpm / 2;
+    while (Music.next < a.currentTime + 0.15) {
+      const s = Music.step, t = Music.next - a.currentTime;
+      const deg = Music.pattern ? Music.pattern[s % Music.pattern.length] : null;
+      if (deg != null && deg >= 0) { const n = Music.scale[deg % Music.scale.length] + 12 * Math.floor(deg / Music.scale.length); E.tone(Music.root * Math.pow(2, n / 12), spb * 0.9, 'triangle', 0.05, 0, t); }
+      if (s % 8 === 0) E.tone(Music.root / 2, spb * 3, 'sine', 0.09, 0, t);
+      if (s % 8 === 4) E.tone(Music.root / 2 * Math.pow(2, Music.scale[3] / 12), spb * 3, 'sine', 0.07, 0, t);
+      if (s % 4 === 2) E.noise(0.04, 0.04, 6000, t);
+      Music.step++; Music.next += spb;
+    }
+  }
+
+  /* ---------- juice ---------- */
+  let shakeAmt = 0, flashA = 0, flashC = '#fff', hitstop = 0;
+  E.shake = (a) => { shakeAmt = Math.max(shakeAmt, a); };
+  E.flash = (c = '#fff', a = 0.5) => { flashC = c; flashA = a; };
+  E.hitstop = (s) => { hitstop = Math.max(hitstop, s); };
+  const parts = (E.particles = []);
+  E.burst = function (x, y, n, color, spd = 4, life = 30, size = 3, grav = 0.1) {
+    for (let i = 0; i < n && parts.length < 900; i++) {
+      const a = Math.random() * Math.PI * 2, s = Math.random() * spd;
+      parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: life * (0.5 + Math.random() * 0.5), max: life, color, size: size * (0.5 + Math.random()), grav });
+    }
+  };
+  E.spark = (x, y, vx, vy, color, life = 20, size = 3, grav = 0) => { if (parts.length < 900) parts.push({ x, y, vx, vy, life, max: life, color, size, grav }); };
+  const popups = [];
+  E.popup = (x, y, text, color = '#fff', size = 22) => popups.push({ x, y, text, color, size, life: 50 });
+  function updateFx() {
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i]; p.x += p.vx; p.y += p.vy; p.vy += p.grav; p.vx *= 0.98; p.life--;
+      if (p.life <= 0) parts.splice(i, 1);
+    }
+    for (let i = popups.length - 1; i >= 0; i--) { const p = popups[i]; p.y -= 0.8; if (--p.life <= 0) popups.splice(i, 1); }
+    shakeAmt *= 0.88; if (shakeAmt < 0.2) shakeAmt = 0; flashA *= 0.9;
+  }
+  E.drawParticles = function (c, camX = 0, camY = 0) {
+    for (const p of parts) {
+      c.globalAlpha = Math.max(0, p.life / p.max); c.fillStyle = p.color;
+      const s = p.size * (0.4 + 0.6 * p.life / p.max);
+      c.fillRect(p.x - camX - s / 2, p.y - camY - s / 2, s, s);
+    }
+    c.globalAlpha = 1;
+  };
+  E.drawPopups = function (c, camX = 0, camY = 0) {
+    for (const p of popups) { c.globalAlpha = Math.min(1, p.life / 20); E.text(p.text, p.x - camX, p.y - camY, p.size, p.color); }
+    c.globalAlpha = 1;
+  };
+  E.clearFx = () => { parts.length = 0; popups.length = 0; };
+
+  /* ---------- text / ui ---------- */
+  E.font = '"Trebuchet MS", "Segoe UI", system-ui, sans-serif';
+  E.text = function (s, x, y, size = 24, color = '#fff', align = 'center', outline = true) {
+    size = Math.max(size, 13); // stays readable on small screens
+    ctx.font = `bold ${size}px ${E.font}`; ctx.textAlign = align; ctx.textBaseline = 'middle';
+    if (outline) { ctx.lineJoin = 'round'; ctx.lineWidth = Math.max(3, size / 6); ctx.strokeStyle = 'rgba(0,0,0,0.75)'; ctx.strokeText(s, x, y); }
+    ctx.fillStyle = color; ctx.fillText(s, x, y);
+  };
+  let buttons = [];
+  E.button = function (label, x, y, w, h, onClick, color = '#ffffff') {
+    const hov = ptr.x > x - w / 2 && ptr.x < x + w / 2 && ptr.y > y - h / 2 && ptr.y < y + h / 2;
+    ctx.fillStyle = hov ? color : 'rgba(0,0,0,0.45)';
+    ctx.strokeStyle = color; ctx.lineWidth = 3;
+    roundRect(x - w / 2, y - h / 2, w, h, 12); ctx.fill(); ctx.stroke();
+    E.text(label, x, y + 1, Math.min(28, h * 0.5), hov ? '#111' : color, 'center', !hov);
+    buttons.push({ x: x - w / 2, y: y - h / 2, w, h, onClick });
+  };
+  function roundRect(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+  E.roundRect = roundRect;
+
+  /* ---------- game flow ---------- */
+  let G = null; // game definition
+  E.best = 0; E.score = 0; E.lastStats = null; E.newBest = false;
+  E.pause = (auto) => { if (E.state !== 'play') return; for (const k in uiPressed) delete uiPressed[k]; E.state = 'pause'; if (auto !== true) SDK.stop(); Music.stop(); };
+  E.resume = () => { if (E.state !== 'pause') return; E.state = 'play'; SDK.start(); G.music && Music.start(G.music); };
+  E.startRun = function () {
+    E.clearFx(); E.score = 0; E.newBest = false;
+    G.start && G.start();
+    E.state = 'play'; SDK.start();
+    G.music && Music.start(G.music);
+  };
+  E.gameOver = function (score, stats) {
+    if (E.state !== 'play') return;
+    E.score = Math.floor(score); E.lastStats = stats || null;
+    if (E.score > E.best) { E.best = E.score; E.save(G.id + '_best', E.best); E.newBest = E.score > 0; if (E.newBest) SDK.happy(); }
+    E.state = 'over'; E.overT = 0; SDK.stop(); Music.stop();
+  };
+  E.toTitle = () => { E.state = 'title'; SDK.stop(); Music.stop(); };
+  /* restart goes through midgame ad (only between runs) */
+  E.retry = () => { E.state = 'ad'; SDK.midgame(() => E.startRun()); };
+
+  function drawPauseIcon() {
+    if (E.state !== 'play') return;
+    const x = W - 34, y = 30;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.arc(x, y, 20, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillRect(x - 7, y - 9, 5, 18); ctx.fillRect(x + 2, y - 9, 5, 18);
+    buttons.push({ x: x - 22, y: y - 22, w: 44, h: 44, onClick: E.pause });
+    // mute icon
+    const mx = W - 84;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.arc(mx, y, 20, 0, 7); ctx.fill();
+    drawSpeaker(mx, y);
+    buttons.push({ x: mx - 22, y: y - 22, w: 44, h: 44, onClick: Audio.toggle });
+  }
+  function drawSpeaker(x, y) {
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(x - 9, y - 4); ctx.lineTo(x - 4, y - 4); ctx.lineTo(x + 2, y - 10); ctx.lineTo(x + 2, y + 10); ctx.lineTo(x - 4, y + 4); ctx.lineTo(x - 9, y + 4); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    if (Audio.userMuted) { ctx.beginPath(); ctx.moveTo(x + 5, y - 5); ctx.lineTo(x + 12, y + 5); ctx.moveTo(x + 12, y - 5); ctx.lineTo(x + 5, y + 5); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.arc(x + 3, y, 7, -0.8, 0.8); ctx.stroke(); }
+  }
+  function drawTouchButtons() {
+    if (!E.touchMode || E.state !== 'play') return;
+    for (const b of E.touchButtons) {
+      ctx.globalAlpha = keys[b.key] ? 0.55 : 0.28;
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 7); ctx.fill();
+      ctx.globalAlpha = 0.9; E.text(b.label, b.x, b.y, b.r * 0.55, '#fff');
+    }
+    ctx.globalAlpha = 1;
+  }
+  function overlay(a = 0.55) { ctx.fillStyle = `rgba(5,5,15,${a})`; ctx.fillRect(0, 0, W, H); }
+
+  function drawTitle() {
+    G.drawBackground ? G.drawBackground(ctx, E.t) : (ctx.fillStyle = '#111', ctx.fillRect(0, 0, W, H));
+    overlay(0.35);
+    const bob = Math.sin(E.t * 2.2) * 6;
+    E.text(G.title, W / 2, 140 + bob, 78, G.color || '#fff');
+    E.text(G.tagline || '', W / 2, 205, 22, '#ddd');
+    E.button(E.touchMode ? 'TAP TO PLAY' : 'PLAY', W / 2, 290, 260, 64, E.startRun, G.color || '#fff');
+    const lines = (E.touchMode ? G.controlsTouch : G.controls) || [];
+    lines.forEach((l, i) => E.text(l, W / 2, 360 + i * 28, 18, '#cfd'));
+    if (E.best > 0) E.text('BEST: ' + E.best, W / 2, H - 40, 22, '#ffd85a');
+    E.text('M: mute', W - 60, H - 20, 14, '#999');
+    if (E.uiHit('Space', 'Enter')) E.startRun();
+  }
+  function drawPause() {
+    G.draw(ctx); overlay(0.6);
+    E.text('PAUSED', W / 2, 170, 64, '#fff');
+    E.button('RESUME', W / 2, 270, 240, 58, E.resume, G.color);
+    E.button(Audio.userMuted ? 'SOUND: OFF' : 'SOUND: ON', W / 2, 340, 240, 50, Audio.toggle, '#aaa');
+    E.button('MENU', W / 2, 405, 240, 50, E.toTitle, '#aaa');
+    if (E.uiHit('Escape', 'KeyP')) E.resume();
+  }
+  function drawOver() {
+    G.draw(ctx); overlay(Math.min(0.7, E.overT / 40));
+        if (E.overT < 25) return;
+    E.text(G.overTitle || 'GAME OVER', W / 2, 120, 64, G.color || '#fff');
+    E.text('SCORE  ' + E.score, W / 2, 195, 40, '#fff');
+    E.text(E.newBest ? 'NEW BEST!' : 'BEST  ' + E.best, W / 2, 240, 26, '#ffd85a');
+    if (E.lastStats) E.lastStats.forEach((s, i) => E.text(s, W / 2, 285 + i * 26, 18, '#cde'));
+    const by = 285 + (E.lastStats ? E.lastStats.length : 0) * 26 + 40;
+    E.button(E.touchMode ? 'TAP TO RETRY' : 'RETRY  (Space)', W / 2, by, 280, 58, E.retry, G.color);
+    E.button('MENU', W / 2, by + 68, 200, 46, E.toTitle, '#aaa');
+    if (E.overT > 40 && E.uiHit('Space', 'Enter', 'KeyR')) E.retry();
+  }
+
+  /* ---------- main loop (fixed 60Hz) ---------- */
+  let last = 0, acc = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(0.1, (now - last) / 1000 || 0); last = now; acc += dt;
+    musicTick();
+    if (E.uiHit('KeyM')) Audio.toggle();
+    let steps = 0;
+    while (acc >= 1 / 60 && steps < 4) {
+      acc -= 1 / 60; steps++;
+      if (E.state === 'play') {
+        if (E.hit('Escape', 'KeyP')) { E.pause(); }
+        else if (hitstop > 0) hitstop -= 1 / 60;
+        else { G.update(1 / 60); updateFx(); }
+      } else { updateFx(); if (E.state === 'over') E.overT++; }
+      for (const k in pressed) delete pressed[k];
+      ptr.clicked = false; ptr.released = false;
+    }
+    if (acc > 0.2) acc = 0;
+    E.t = now / 1000;
+    render();
+    for (const k in uiPressed) delete uiPressed[k];
+    ptr.uiClick = false;
+  }
+  function render() {
+    buttons = [];
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+    ctx.save();
+    if (shakeAmt > 0 && E.state === 'play') ctx.translate(E.rand(-shakeAmt, shakeAmt), E.rand(-shakeAmt, shakeAmt));
+    if (E.state === 'title') drawTitle();
+    else if (E.state === 'play') { G.draw(ctx); drawTouchButtons(); }
+    else if (E.state === 'pause') drawPause();
+    else if (E.state === 'over') drawOver();
+    else if (E.state === 'ad') { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); E.text('...', W / 2, H / 2, 40, '#888'); }
+    else if (E.state === 'boot') { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H); E.text('LOADING', W / 2, H / 2, 30, '#888'); }
+    ctx.restore();
+    if (flashA > 0.02) { ctx.globalAlpha = flashA; ctx.fillStyle = flashC; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1; }
+    drawPauseIcon();
+    if (ptr.uiClick) {
+      for (let i = buttons.length - 1; i >= 0; i--) {
+        const b = buttons[i];
+        if (ptr.x >= b.x && ptr.x <= b.x + b.w && ptr.y >= b.y && ptr.y <= b.y + b.h) { E.tone(660, 0.06, 'square', 0.1); ptr.uiClick = false; b.onClick(); break; }
+      }
+    }
+  }
+
+  E.run = async function (game) {
+    G = E.game = game;
+    requestAnimationFrame(frame);
+    E.best = E.load(G.id + '_best', 0);
+    Audio.userMuted = E.load('mute_' + document.title, false); Audio.apply();
+    G.init && G.init();
+    E.state = 'title';
+  };
+})();
+
+</script>
+<script>
+// BG:#0b0f1a
+/* ECHO STEP — every time you die you leave a stone echo of yourself behind.
+   Echoes are solid: stand on them, cover spikes with them, stack them into stairs.
+   You can also PETRIFY on purpose. Each room gives you a limited echo budget. */
+(function () {
+  const E = Engine, W = E.W, H = E.H, T = 30, COLS = 32, ROWS = 18;
+  const GRAV = 0.55, JUMP = -10.6, RUN = 4.2, BOUNCE = -15.5;
+
+  // ---- level builder helpers ----
+  function blank() { const g = []; for (let y = 0; y < ROWS; y++) { g.push([]); for (let x = 0; x < COLS; x++) g[y].push(x === 0 || x === COLS - 1 || y === 0 || y >= ROWS - 2 ? '#' : '.'); } return g; }
+  function fill(g, x, y, w, h, ch) { for (let j = y; j < y + h; j++) for (let i = x; i < x + w; i++) if (g[j] && i >= 0 && i < COLS) g[j][i] = ch; }
+  const LEVELS = [
+    { name: 'First Steps', budget: 3, hint: 'Move with ARROWS / A-D, jump with SPACE. Reach the door.', touchHint: 'Move with ◀ ▶, jump with ▲. Reach the door.',
+      build(g) { fill(g, 12, 16, 3, 1, '^'); fill(g, 20, 15, 2, 1, '#'); fill(g, 24, 14, 7, 2, '#'); g[13][28] = 'D'; g[12][13] = '*'; return [2, 15]; } },
+    { name: 'Leave a Mark', budget: 3, hint: 'Too tall? Press E (or DOWN) to PETRIFY into a stone echo, then climb it.', touchHint: 'Too tall? Press ◆ to PETRIFY into a stone echo, then climb it.',
+      build(g) { fill(g, 16, 12, 2, 4, '#'); g[15][28] = 'D'; g[8][16] = '*'; return [3, 15]; } },
+    { name: 'Bridge of Bodies', budget: 4, hint: 'Spikes kill you, but an echo covers the spike it lands on.',
+      build(g) { fill(g, 8, 16, 16, 1, '^'); g[15][29] = 'D'; g[11][16] = '*'; return [2, 15]; } },
+    { name: 'Saw Mill', budget: 3, hint: 'Saws pass through everything. Watch their rhythm.',
+      build(g, L) { fill(g, 6, 15, 2, 1, '#'); fill(g, 24, 15, 2, 1, '#'); g[15][29] = 'D'; g[9][15] = '*';
+        L.saws = [{ x: 10, y: 12.5, ax: 'y', r: 2.6, s: 2.2 }, { x: 15, y: 12.5, ax: 'y', r: 2.6, s: 2.2, p: 2 }, { x: 20, y: 12.5, ax: 'y', r: 2.6, s: 2.6, p: 4 }]; return [2, 15]; } },
+    { name: 'Stacked', budget: 4, hint: 'Petrify on top of an echo to stack them higher.',
+      build(g) { fill(g, 14, 11, 17, 5, '#'); g[10][28] = 'D'; g[5][20] = '*'; fill(g, 9, 16, 2, 1, '^'); return [3, 15]; } },
+    { name: 'Launch Pad', budget: 5, hint: 'Pads launch you skyward. Petrify in mid-air to build a floating step.',
+      build(g) { fill(g, 6, 16, 20, 1, '^'); g[15][4] = '~'; fill(g, 26, 10, 5, 6, '#'); g[9][29] = 'D'; g[5][15] = '*'; return [2, 15]; } },
+    { name: 'Low Ceiling', budget: 3, hint: 'Tap jump for a short hop. Hold it for a big one.',
+      build(g) { fill(g, 7, 1, 19, 11, '#'); fill(g, 7, 12, 19, 1, 'v'); fill(g, 10, 16, 2, 1, '^'); fill(g, 15, 16, 2, 1, '^'); fill(g, 20, 16, 2, 1, '^'); g[15][29] = 'D'; g[14][18] = '*'; return [2, 15]; } },
+    { name: 'The Climb', budget: 3, hint: 'Up you go. The saws patrol the ledges.',
+      build(g, L) { fill(g, 8, 13, 5, 1, '#'); fill(g, 16, 10, 5, 1, '#'); fill(g, 24, 7, 5, 1, '#'); fill(g, 13, 4, 9, 1, '#'); g[3][15] = 'D'; g[2][27] = '*'; fill(g, 1, 16, 30, 1, '#'); fill(g, 14, 16, 16, 1, '^');
+        L.saws = [{ x: 18.5, y: 9.4, ax: 'x', r: 2.2, s: 1.8 }, { x: 26.5, y: 6.4, ax: 'x', r: 2.2, s: 2.2, p: 1 }]; return [2, 15]; } },
+    { name: 'Pit and Wall', budget: 5, hint: 'Two problems. Spend your echoes wisely.',
+      build(g) { fill(g, 6, 16, 9, 1, '^'); fill(g, 20, 11, 2, 5, '#'); fill(g, 22, 16, 9, 1, '#'); g[15][28] = 'D'; g[9][10] = '*'; return [2, 15]; } },
+    { name: 'Echo Chamber', budget: 4, hint: 'Everything you have learned. Make every death count.',
+      build(g, L) { fill(g, 5, 16, 21, 1, '^'); g[15][3] = '~'; fill(g, 9, 11, 2, 1, '#'); fill(g, 15, 9, 2, 1, '#'); fill(g, 20, 11, 2, 1, '#'); fill(g, 26, 12, 5, 4, '#'); g[11][29] = 'D'; g[6][15] = '*';
+        L.saws = [{ x: 13, y: 8.5, ax: 'y', r: 3.2, s: 1.6 }, { x: 18.5, y: 8.5, ax: 'y', r: 3.2, s: 1.9, p: 3 }]; return [1, 15]; } },
+  ];
+
+  let lvl, L, grid, P, echoes, deaths, state, stateT, levelT, total, gotShard, respawnT, best, runStart;
+
+  function loadLevel(i) {
+    lvl = i; L = { saws: [] }; grid = blank();
+    const sp = LEVELS[i].build(grid, L); L.spawn = sp;
+    echoes = []; deaths = 0; gotShard = false; levelT = 0; state = 'play'; stateT = 0;
+    spawn();
+  }
+  function spawn() { P = { x: L.spawn[0] * T + 5, y: L.spawn[1] * T + 4, vx: 0, vy: 0, w: 20, h: 26, ground: false, coyote: 0, buffer: 0, face: 1, squash: 1, alive: true }; }
+  const cell = (cx, cy) => (cx < 0 || cx >= COLS || cy < 0 ? '#' : cy >= ROWS ? '.' : grid[cy][cx]);
+  const solid = (ch) => ch === '#' || ch === 'E' || ch === '~';
+
+  function collide(axis) {
+    const x0 = Math.floor(P.x / T), x1 = Math.floor((P.x + P.w - 0.01) / T), y0 = Math.floor(P.y / T), y1 = Math.floor((P.y + P.h - 0.01) / T);
+    for (let cy = y0; cy <= y1; cy++) for (let cx = x0; cx <= x1; cx++) {
+      const ch = cell(cx, cy); if (!solid(ch)) continue;
+      if (axis === 'x') { if (P.vx > 0) P.x = cx * T - P.w; else if (P.vx < 0) P.x = (cx + 1) * T; P.vx = 0; }
+      else {
+        if (P.vy > 0) { P.y = cy * T - P.h; if (ch === '~') { P.vy = BOUNCE; bounceFx(cx, cy); return; } P.vy = 0; P.ground = true; }
+        else if (P.vy < 0) { P.y = (cy + 1) * T; P.vy = 0; }
+      }
+      return;
+    }
+  }
+  function bounceFx(cx, cy) { E.tone(220, 0.25, 'square', 0.12, 880); E.burst(cx * T + 15, cy * T, 16, '#ffd84a', 4, 24, 3, 0.1); E.shake(4); P.squash = 0.5; }
+
+  function kill(cause, sx, sy) {
+    if (!P.alive) return;
+    P.alive = false; deaths++; respawnT = 42;
+    // snap an echo into the cell at the player's center
+    let cx = Math.floor((P.x + P.w / 2) / T), cy = Math.floor((P.y + P.h / 2) / T);
+    if (sx != null) { cx = sx; cy = sy; }
+    const pit = cy >= ROWS - 1;
+    if (!pit) {
+      while (cy > 0 && solid(cell(cx, cy))) cy--;
+      if (cy >= ROWS - 1) cy = ROWS - 2;
+      if (cell(cx, cy) === 'D') cy--;
+      const prev = grid[cy][cx];
+      echoes.push({ cx, cy, prev, t: 0 });
+      grid[cy][cx] = 'E';
+      if (echoes.length > LEVELS[lvl].budget) {
+        const o = echoes.shift(); grid[o.cy][o.cx] = o.prev;
+        E.burst(o.cx * T + 15, o.cy * T + 15, 20, '#8899bb', 4, 40, 4, 0.2); E.popup(o.cx * T + 15, o.cy * T, 'oldest echo crumbles', '#aab', 16);
+      }
+    }
+    E.shake(cause === 'petrify' ? 5 : 12); E.flash(cause === 'petrify' ? '#9fd' : '#f35', 0.25);
+    E.burst(P.x + 10, P.y + 13, 30, cause === 'petrify' ? '#9fe7ff' : '#ff4466', 5, 40, 4, 0.15);
+    if (cause === 'petrify') { E.tone(160, 0.3, 'triangle', 0.18, 90); E.noise(0.2, 0.2, 800); }
+    else { E.noise(0.3, 0.35, 2500); E.tone(400, 0.3, 'sawtooth', 0.12, 100); }
+  }
+  function overlapsCell(cx, cy, top, bot) {
+    const rx = cx * T + 6, rw = T - 12, ry = cy * T + top, rh = bot - top;
+    return P.x < rx + rw && P.x + P.w > rx && P.y < ry + rh && P.y + P.h > ry;
+  }
+
+  const game = {
+    id: 'echo-step', title: 'ECHO STEP', color: '#7fe7ff',
+    tagline: 'Every death leaves a stone echo. Build your way out of every room.',
+    overTitle: 'ALL ROOMS CLEARED',
+    controls: ['ARROWS / A-D : move     SPACE / W / UP : jump', 'E / DOWN : petrify (leave an echo on purpose)', 'R : reset room (clears echoes)     P / ESC : pause'],
+    controlsTouch: ['◀ ▶ move   ▲ jump   ◆ petrify', 'Echoes are solid. Stand on them, cover spikes with them.'],
+    music: { bpm: 96, root: 174.6, scale: [0, 2, 3, 7, 9], pattern: [0, -1, 4, -1, 2, -1, 3, 5, 0, -1, 4, -1, 7, -1, 6, 5] },
+    init() {
+      best = E.load('echo-step_level', 0);
+      E.touchButtons = [
+        { key: 'ArrowLeft', label: '◀', x: 75, y: H - 75, r: 52 }, { key: 'ArrowRight', label: '▶', x: 195, y: H - 75, r: 52 },
+        { key: 'KeyE', label: '◆', x: W - 205, y: H - 70, r: 46 }, { key: 'Space', label: '▲', x: W - 80, y: H - 85, r: 58 },
+      ];
+    },
+    start() { total = 0; runStart = Math.min(E.load('echo-step_level', 0), LEVELS.length - 1); loadLevel(runStart); E.clearFx(); },
+    update() {
+      stateT++;
+      if (state === 'clear') {
+        if (stateT === 100) {
+          if (lvl + 1 >= LEVELS.length) { E.save('echo-step_level', 0); E.sdk.happy(); E.gameOver(total, ['Rooms cleared: ' + (LEVELS.length - runStart), 'Final room conquered. Progress reset for a new run.']); return; }
+          state = 'ad'; E.sdk.stop(); E.music.stop();
+          E.sdk.midgame(() => { loadLevel(lvl + 1); E.sdk.start(); E.music.start(game.music); });
+        }
+        return;
+      }
+      if (state === 'ad') return;
+      levelT++;
+      for (const s of L.saws) { const o = Math.sin(levelT / 60 * s.s + (s.p || 0)) * s.r; s.cx = (s.x + (s.ax === 'x' ? o : 0)) * T; s.cy = (s.y + (s.ax === 'y' ? o : 0)) * T; }
+      for (const e of echoes) e.t++;
+      if (E.hit('KeyR')) { loadLevel(lvl); E.tone(300, 0.1, 'square', 0.1, 150); return; }
+      if (!P.alive) { if (--respawnT <= 0) spawn(); return; }
+
+      // horizontal
+      const l = E.down('ArrowLeft', 'KeyA'), r = E.down('ArrowRight', 'KeyD');
+      const acc = P.ground ? 0.9 : 0.55;
+      if (l && !r) { P.vx = Math.max(-RUN, P.vx - acc); P.face = -1; }
+      else if (r && !l) { P.vx = Math.min(RUN, P.vx + acc); P.face = 1; }
+      else P.vx *= P.ground ? 0.6 : 0.9;
+      if (Math.abs(P.vx) < 0.05) P.vx = 0;
+      // jump
+      if (E.hit('Space', 'KeyW', 'ArrowUp', 'KeyZ')) P.buffer = 7;
+      if (P.buffer > 0) { P.buffer--; if (P.coyote > 0) { P.vy = JUMP; P.coyote = 0; P.buffer = 0; P.ground = false; P.squash = 0.65; E.tone(420, 0.09, 'square', 0.1, 720); E.burst(P.x + 10, P.y + 26, 6, '#cfe', 2, 14, 2, 0.05); } }
+      if (!E.down('Space', 'KeyW', 'ArrowUp', 'KeyZ') && P.vy < -3) P.vy *= 0.75;
+      // petrify
+      if (E.hit('KeyE', 'ArrowDown', 'KeyS', 'ShiftLeft')) { kill('petrify'); return; }
+
+      P.vy = Math.min(13, P.vy + GRAV);
+      const wasGround = P.ground; P.ground = false;
+      P.x += P.vx; collide('x');
+      P.y += P.vy; collide('y');
+      if (P.ground) P.coyote = 6; else P.coyote--;
+      if (P.ground && !wasGround) { P.squash = 1.3; E.tone(120, 0.05, 'triangle', 0.08); }
+      P.squash = E.lerp(P.squash, 1, 0.2);
+      if (P.y > H) { kill('fall'); E.popup(P.x, H - 40, 'no echo from the void', '#f9a', 16); return; }
+
+      // tile interactions
+      const x0 = Math.floor(P.x / T), x1 = Math.floor((P.x + P.w) / T), y0 = Math.floor(P.y / T), y1 = Math.floor((P.y + P.h) / T);
+      for (let cy = y0; cy <= y1; cy++) for (let cx = x0; cx <= x1; cx++) {
+        const ch = cell(cx, cy);
+        if (ch === '^' && overlapsCell(cx, cy, 14, 30)) return kill('spike', cx, cy);
+        if (ch === 'v' && overlapsCell(cx, cy, 0, 16)) return kill('spike', cx, cy);
+        if (ch === '*' && overlapsCell(cx, cy, 4, 26)) { grid[cy][cx] = '.'; gotShard = true; E.burst(cx * T + 15, cy * T + 15, 20, '#ffe066', 4, 30, 3, 0); [880, 1175, 1568].forEach((f, i) => E.tone(f, 0.12, 'triangle', 0.1, 0, i * 0.05)); E.popup(cx * T + 15, cy * T, 'SHARD +200', '#ffe066'); }
+        if (ch === 'D' && overlapsCell(cx, cy, 0, 30)) return clear();
+      }
+      for (const s of L.saws) if (E.dist(P.x + 10, P.y + 13, s.cx, s.cy) < 26) return kill('saw');
+      if (levelT % 3 === 0 && Math.abs(P.vx) > 2 && P.ground) E.spark(P.x + 10, P.y + 26, -P.vx * 0.2, -0.5, '#6a7fa0', 16, 3, 0);
+    },
+    drawBackground(c) { bg(c); },
+    draw(c) {
+      bg(c);
+      // tiles
+      for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+        const ch = grid[y][x], px = x * T, py = y * T;
+        if (ch === '#') {
+          c.fillStyle = '#2a3657'; c.fillRect(px, py, T, T); c.fillStyle = '#25304d'; c.fillRect(px, py + T - 3, T, 3);
+          const exposed = y > 0 && !solid(grid[y - 1][x]);
+          if (exposed) { c.fillStyle = '#4fd1e8'; c.fillRect(px, py, T, 3); }
+          c.fillStyle = '#33416a'; if ((x + y) % 3 === 0) c.fillRect(px + 6, py + 10, 8, 4);
+        } else if (ch === '^') spike(c, px, py, 1);
+        else if (ch === 'v') spike(c, px, py, -1);
+        else if (ch === '~') { c.fillStyle = '#3a3320'; c.fillRect(px, py + 10, T, 20); c.fillStyle = '#ffd84a'; c.fillRect(px + 2, py + 6 + Math.sin(E.t * 8) * 2, T - 4, 6); }
+        else if (ch === 'D') door(c, px, py);
+        else if (ch === '*') { c.save(); c.translate(px + 15, py + 15 + Math.sin(E.t * 3) * 3); c.rotate(E.t); c.fillStyle = '#ffe066'; c.beginPath(); for (let i = 0; i < 5; i++) { const a = i * 1.2566 - 1.57, b = a + 0.628; c.lineTo(Math.cos(a) * 10, Math.sin(a) * 10); c.lineTo(Math.cos(b) * 4.5, Math.sin(b) * 4.5); } c.fill(); c.restore(); }
+      }
+      // echoes
+      for (const e of echoes) {
+        const px = e.cx * T, py = e.cy * T, k = Math.min(1, e.t / 12);
+        c.fillStyle = '#5c6b86'; c.fillRect(px + 1, py + 1, T - 2, T - 2);
+        c.fillStyle = '#7d8eab'; c.fillRect(px + 1, py + 1, T - 2, 4);
+        c.globalAlpha = 0.55 * k; c.fillStyle = '#bff3ff';
+        c.beginPath(); c.arc(px + 15, py + 11, 5, 0, 7); c.fill(); c.fillRect(px + 10, py + 15, 10, 11);
+        c.globalAlpha = 1;
+        c.strokeStyle = 'rgba(127,231,255,' + (0.4 + Math.sin(E.t * 3 + e.cx) * 0.2) + ')'; c.lineWidth = 2; c.strokeRect(px + 1, py + 1, T - 2, T - 2);
+      }
+      // saws
+      for (const s of L.saws) {
+        if (s.cx == null) continue;
+        c.save(); c.translate(s.cx, s.cy); c.rotate(E.t * 12);
+        c.fillStyle = '#c8ced8'; c.beginPath();
+        for (let i = 0; i < 16; i++) { const a = (i / 16) * Math.PI * 2, rr = i % 2 ? 14 : 19; c.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); }
+        c.fill(); c.fillStyle = '#ff4466'; c.beginPath(); c.arc(0, 0, 5, 0, 7); c.fill(); c.restore();
+      }
+      E.drawParticles(c);
+      if (P.alive) drawPlayer(c);
+      // HUD
+      c.fillStyle = 'rgba(0,0,0,0.45)'; c.fillRect(0, 0, W, 30);
+      E.text('ROOM ' + (lvl + 1) + '/' + LEVELS.length + ' · ' + LEVELS[lvl].name, 14, 15, 17, '#7fe7ff', 'left');
+      const left = LEVELS[lvl].budget - echoes.length;
+      for (let i = 0; i < LEVELS[lvl].budget; i++) { c.fillStyle = i < left ? '#7fe7ff' : 'rgba(127,231,255,0.2)'; c.fillRect(360 + i * 18, 8, 12, 14); }
+      E.text('ECHOES', 360 + LEVELS[lvl].budget * 18 + 6, 15, 14, '#9bd', 'left');
+      E.text('SCORE ' + total, W - 130, 15, 17, '#fff', 'right');
+      if (levelT < 400 || lvl < 2) { c.globalAlpha = Math.min(1, (420 - Math.min(levelT, 400)) / 40) || 1; if (lvl < 2) c.globalAlpha = 1; E.text((E.touchMode && LEVELS[lvl].touchHint) || LEVELS[lvl].hint, W / 2, 52, 18, '#dfefff'); c.globalAlpha = 1; }
+      E.drawPopups(c);
+      if (state === 'clear') {
+        c.fillStyle = 'rgba(5,10,20,' + Math.min(0.6, stateT / 30) + ')'; c.fillRect(0, 0, W, H);
+        E.text('ROOM CLEAR', W / 2, 200, 56, '#7fe7ff');
+        E.text('+' + L.gain, W / 2, 260, 34, '#fff');
+        E.text(L.detail, W / 2, 300, 18, '#bcd');
+      }
+    },
+  };
+  function clear() {
+    state = 'clear'; stateT = 0;
+    const timeBonus = Math.max(0, 300 - Math.floor(levelT / 60) * 5), unused = LEVELS[lvl].budget - echoes.length;
+    const gain = 500 + timeBonus + Math.max(0, unused) * 100 - deaths * 20 + (gotShard ? 200 : 0);
+    L.gain = Math.max(100, gain); total += L.gain; E.score = total;
+    L.detail = 'time +' + timeBonus + '  ·  unused echoes +' + Math.max(0, unused) * 100 + (gotShard ? '  ·  shard +200' : '') + '  ·  deaths ' + deaths;
+    if (lvl + 1 < LEVELS.length) E.save('echo-step_level', Math.max(E.load('echo-step_level', 0), lvl + 1));
+    E.flash('#7fe7ff', 0.4); E.burst(P.x + 10, P.y + 13, 50, '#7fe7ff', 6, 50, 4, 0);
+    [523, 659, 784, 1046, 1318].forEach((f, i) => E.tone(f, 0.2, 'triangle', 0.12, 0, i * 0.07));
+  }
+  function spike(c, px, py, dir) {
+    c.fillStyle = '#ff4466';
+    for (let i = 0; i < 3; i++) {
+      c.beginPath();
+      if (dir > 0) { c.moveTo(px + i * 10, py + T); c.lineTo(px + i * 10 + 5, py + 12); c.lineTo(px + i * 10 + 10, py + T); }
+      else { c.moveTo(px + i * 10, py); c.lineTo(px + i * 10 + 5, py + 18); c.lineTo(px + i * 10 + 10, py); }
+      c.fill();
+    }
+  }
+  function door(c, px, py) {
+    const g = c.createLinearGradient(0, py - 20, 0, py + T); g.addColorStop(0, 'rgba(127,231,255,0)'); g.addColorStop(1, 'rgba(127,231,255,0.5)');
+    c.fillStyle = g; c.fillRect(px - 4, py - 24, T + 8, T + 24);
+    c.strokeStyle = '#7fe7ff'; c.lineWidth = 3; c.beginPath(); c.moveTo(px + 3, py + T); c.lineTo(px + 3, py - 10); c.arc(px + 15, py - 10, 12, Math.PI, 0); c.lineTo(px + 27, py + T); c.stroke();
+    c.fillStyle = 'rgba(200,250,255,' + (0.3 + Math.sin(E.t * 4) * 0.2) + ')'; c.fillRect(px + 6, py - 6, 18, T + 6);
+  }
+  function drawPlayer(c) {
+    c.save(); c.translate(P.x + P.w / 2, P.y + P.h); c.scale(P.face / Math.sqrt(P.squash), P.squash);
+    c.fillStyle = '#2b3a5c'; c.beginPath(); c.moveTo(-11, 0); c.lineTo(-8, -20); c.quadraticCurveTo(0, -32, 8, -20); c.lineTo(11, 0); c.fill(); // cloak
+    c.fillStyle = '#3d5285'; c.beginPath(); c.arc(1, -19, 8, 0, 7); c.fill(); // hood
+    c.fillStyle = '#7fe7ff'; c.fillRect(2, -21, 3, 3); c.fillRect(7, -21, 2, 3); // eyes
+    c.fillStyle = '#7fe7ff'; c.globalAlpha = 0.4; c.fillRect(-9, -4, 18, 2); c.restore(); c.globalAlpha = 1;
+  }
+  function bg(c) {
+    const g = c.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#0b1020'); g.addColorStop(1, '#141a30'); c.fillStyle = g; c.fillRect(0, 0, W, H);
+    c.strokeStyle = 'rgba(127,231,255,0.04)'; c.lineWidth = 1;
+    for (let x = 0; x < W; x += T) { c.beginPath(); c.moveTo(x, 0); c.lineTo(x, H); c.stroke(); }
+    for (let y = 0; y < H; y += T) { c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke(); }
+    for (let i = 0; i < 6; i++) { c.fillStyle = 'rgba(127,231,255,0.05)'; c.beginPath(); c.arc((i * 211 + E.t * 8) % (W + 100) - 50, 100 + ((i * 97) % 300), 40 + i * 10, 0, 7); c.fill(); }
+  }
+  E.dbg = () => ({ P, grid, echoes, lvl, state, L, levelT, load: loadLevel, LEVELS,
+    snap: () => JSON.stringify({ P, grid, echoes, levelT, deaths, respawnT, state, stateT, gotShard }),
+    restore: (j) => { const o = JSON.parse(j); P = o.P; grid = o.grid; echoes = o.echoes; levelT = o.levelT; deaths = o.deaths; respawnT = o.respawnT; state = o.state; stateT = o.stateT; gotShard = o.gotShard; } });
+  E.run(game);
+})();
+
+</script>
+</body></html>
