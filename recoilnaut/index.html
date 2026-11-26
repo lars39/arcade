@@ -24,6 +24,30 @@
     W.prototype = C.prototype; try { Object.setPrototypeOf(W, C); } catch(e){}
     window[n] = W;
   });
+  var realGP = navigator.getGamepads ? navigator.getGamepads.bind(navigator) : null;
+  var padHold = {};
+  var ZERO = {pressed:false, touched:false, value:0};
+  function maskPad(g){
+    var bs = [], hold = padHold[g.index] || {};
+    for (var i = 0; i < g.buttons.length; i++) {
+      var b = g.buttons[i];
+      if (hold[i] && !(b.pressed || b.value > 0.5)) delete hold[i];
+      bs.push((i === 9 || paused || hold[i]) ? ZERO : b);
+    }
+    var ax = [];
+    for (var j = 0; j < g.axes.length; j++) ax.push(paused ? 0 : g.axes[j]);
+    return {id:g.id, index:g.index, connected:g.connected, mapping:g.mapping, timestamp:g.timestamp,
+      axes:ax, buttons:bs, vibrationActuator:g.vibrationActuator, hapticActuators:g.hapticActuators};
+  }
+  if (realGP) {
+    try {
+      navigator.getGamepads = function(){
+        var l = realGP(); if (!l) return l; var out = [];
+        for (var i = 0; i < l.length; i++) out.push(l[i] ? maskPad(l[i]) : null);
+        return out;
+      };
+    } catch(e){}
+  }
   var held = {};
   var box = null, keepBtn = null;
   function build(){
@@ -41,8 +65,9 @@
       if (b.dataset.a === 'keep') close(); else leave();
     });
     keepBtn = box.querySelector('[data-a=keep]');
+    box.querySelectorAll('button').forEach(function(b){ b.addEventListener('focus', function(){ select(b); }); });
     var st = document.createElement('style');
-    st.textContent = '[data-a]:focus-visible{outline:3px solid #4dd8ff;outline-offset:2px}';
+    st.textContent = '[data-a]:focus-visible,[data-a].sel{outline:3px solid #4dd8ff;outline-offset:2px}';
     box.appendChild(st);
   }
   function fireKeyup(code, key){
@@ -50,6 +75,70 @@
       try { t.dispatchEvent(new KeyboardEvent('keyup', {key:key, code:code, bubbles:true})); } catch(e){}
     });
   }
+  function select(b){
+    if (!box) return;
+    box.querySelectorAll('button').forEach(function(x){ x.classList.toggle('sel', x === b); });
+    if (document.activeElement !== b) b.focus();
+  }
+  var pbtn = null;
+  function showPauseBtn(){
+    if (pbtn) return;
+    var mk = function(){
+      if (pbtn || !document.body) return;
+      pbtn = document.createElement('button');
+      pbtn.type = 'button'; pbtn.id = 'arcade-pause-btn'; pbtn.setAttribute('aria-label', 'Pause game');
+      pbtn.innerHTML = '<span></span><span></span>';
+      pbtn.style.cssText = 'position:fixed;left:max(8px,env(safe-area-inset-left,0px));top:38%;z-index:2147483646;width:44px;height:44px;border-radius:50%;border:2px solid rgba(255,255,255,.55);background:rgba(16,12,30,.55);display:flex;align-items:center;justify-content:center;gap:5px;padding:0;margin:0;cursor:pointer;touch-action:none;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none';
+      pbtn.querySelectorAll('span').forEach(function(sp){ sp.style.cssText = 'display:block;width:5px;height:16px;border-radius:2px;background:#fff'; });
+      var go = function(e){ e.preventDefault(); e.stopPropagation(); if (e.stopImmediatePropagation) e.stopImmediatePropagation(); open(); };
+      pbtn.addEventListener('pointerdown', go);
+      ['pointerup','mousedown','mouseup','touchstart','touchend','click','contextmenu'].forEach(function(t){
+        pbtn.addEventListener(t, function(e){ e.stopPropagation(); if (t !== 'touchstart' && t !== 'touchend') e.preventDefault(); }, {passive:false});
+      });
+      document.body.appendChild(pbtn);
+      if (paused) pbtn.style.display = 'none';
+    };
+    if (document.body) mk(); else document.addEventListener('DOMContentLoaded', mk);
+  }
+  var coarse = false;
+  try { coarse = window.matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0; } catch(e){}
+  if (coarse) showPauseBtn();
+  window.addEventListener('touchstart', function(){ showPauseBtn(); }, {capture:true, passive:true});
+  var padPrev = {}, padCd = 0, padLoop = false;
+  function pollPads(){
+    if (!realGP) return;
+    var l; try { l = realGP(); } catch(e){ l = null; }
+    var any = false;
+    if (l) for (var i = 0; i < l.length; i++) {
+      var g = l[i]; if (!g) continue; any = true;
+      var prev = padPrev[g.index] || {}, now = {};
+      for (var k = 0; k < g.buttons.length; k++) now[k] = !!(g.buttons[k].pressed || g.buttons[k].value > 0.5);
+      var hh = padHold[g.index]; if (hh) for (var hk in hh) if (!now[hk]) delete hh[hk];
+      var hit = function(n){ return now[n] && !prev[n]; };
+      if (hit(9)) { paused ? closeFromPad(g) : open(); }
+      else if (paused && box) {
+        var bs = box.querySelectorAll('button');
+        var cur = document.activeElement === bs[1] ? 1 : 0;
+        var ay = g.axes[1] || 0;
+        var up = hit(12) || hit(14), down = hit(13) || hit(15);
+        if (!up && !down && Math.abs(ay) > 0.6 && padCd <= 0) { if (ay < 0) up = true; else down = true; padCd = 18; }
+        if (Math.abs(ay) < 0.3) padCd = 0; else if (padCd > 0) padCd--;
+        if (up || down) select(bs[cur ? 0 : 1]);
+        else if (hit(0)) { if (cur === 1) leave(); else closeFromPad(g); }
+        else if (hit(1)) closeFromPad(g);
+      }
+      padPrev[g.index] = now;
+    }
+    if (any) realRaf(pollPads); else padLoop = false;
+  }
+  function closeFromPad(g){
+    var h = padHold[g.index] = padHold[g.index] || {};
+    for (var k = 0; k < g.buttons.length; k++) if (g.buttons[k].pressed || g.buttons[k].value > 0.5) h[k] = true;
+    close();
+  }
+  function startPads(){ if (!padLoop && realGP) { padLoop = true; realRaf(pollPads); } }
+  window.addEventListener('gamepadconnected', startPads);
+  try { var gl = realGP && realGP(); if (gl) for (var q = 0; q < gl.length; q++) if (gl[q]) { startPads(); break; } } catch(e){}
   function open(){
     if (paused) return;
     for (var c in held) fireKeyup(c, held[c]);
@@ -58,12 +147,14 @@
     ctxs.forEach(function(c){ if (c.state === 'running') { c.__escSusp = true; c.suspend(); } });
     if (!box) build();
     (document.body || document.documentElement).appendChild(box);
-    keepBtn.focus();
+    select(keepBtn);
+    if (pbtn) pbtn.style.display = 'none';
   }
   function close(){
     if (!paused) return;
     offset += realNow() - pausedAt; paused = false;
     if (box && box.parentNode) box.parentNode.removeChild(box);
+    if (pbtn) pbtn.style.display = 'flex';
     ctxs.forEach(function(c){ if (c.__escSusp) { c.__escSusp = false; c.resume(); } });
     if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
     try { window.focus(); } catch(e){}
