@@ -1,7 +1,130 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
+<meta charset="utf-8"><script id="arcade-esc-menu">(function(){
+  if (window.__arcadeEsc) return; window.__arcadeEsc = true;
+  var paused = false, pausedAt = 0, offset = 0;
+  var realNow = performance.now.bind(performance);
+  performance.now = function(){ return (paused ? pausedAt : realNow()) - offset; };
+  var realRaf = window.requestAnimationFrame.bind(window), realCaf = window.cancelAnimationFrame.bind(window);
+  var jobs = new Map(), nextId = 1;
+  window.requestAnimationFrame = function(cb){
+    var id = nextId++;
+    var run = function(){
+      if (!jobs.has(id)) return;
+      if (paused) { jobs.set(id, realRaf(run)); return; }
+      jobs.delete(id); cb(performance.now());
+    };
+    jobs.set(id, realRaf(run));
+    return id;
+  };
+  window.cancelAnimationFrame = function(id){ if (jobs.has(id)) { realCaf(jobs.get(id)); jobs.delete(id); } };
+  var ctxs = [];
+  ['AudioContext','webkitAudioContext'].forEach(function(n){
+    var C = window[n]; if (!C) return;
+    var W = function(a,b){ var c = new C(a,b); ctxs.push(c); return c; };
+    W.prototype = C.prototype; try { Object.setPrototypeOf(W, C); } catch(e){}
+    window[n] = W;
+  });
+  var held = {};
+  var box = null, keepBtn = null;
+  function build(){
+    box = document.createElement('div');
+    box.setAttribute('role','dialog'); box.setAttribute('aria-modal','true'); box.setAttribute('aria-label','Game paused');
+    box.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(8,6,16,.6);font-family:"Chakra Petch","Trebuchet MS",system-ui,sans-serif';
+    box.innerHTML = '<div style="background:#1b1630;border:1px solid #463a7a;border-radius:14px;padding:22px 22px 18px;min-width:240px;max-width:86vw;text-align:center;box-shadow:0 18px 50px rgba(0,0,0,.6);color:#f2eeff">' +
+      '<div style="font-family:inherit;font-weight:700;font-size:13px;line-height:1;letter-spacing:2px;color:#a79fcb;margin-bottom:14px">GAME PAUSED</div>' +
+      '<button data-a="keep" style="display:block;width:100%;margin:0 0 10px;padding:12px 16px;border:0;border-radius:10px;background:#ffd23f;color:#16101f;font-family:inherit;font-weight:700;font-size:17px;cursor:pointer">Keep playing</button>' +
+      '<button data-a="leave" style="display:block;width:100%;margin:0;padding:12px 16px;border:1px solid #463a7a;border-radius:10px;background:#251e42;color:#f2eeff;font-family:inherit;font-weight:700;font-size:17px;cursor:pointer">Leave game</button></div>';
+    var stop = function(e){ e.stopPropagation(); };
+    ['pointerdown','pointerup','mousedown','mouseup','touchstart','touchend','click','wheel','contextmenu'].forEach(function(t){ box.addEventListener(t, stop); });
+    box.addEventListener('click', function(e){
+      var b = e.target.closest && e.target.closest('button'); if (!b) return;
+      if (b.dataset.a === 'keep') close(); else leave();
+    });
+    keepBtn = box.querySelector('[data-a=keep]');
+    var st = document.createElement('style');
+    st.textContent = '[data-a]:focus-visible{outline:3px solid #4dd8ff;outline-offset:2px}';
+    box.appendChild(st);
+  }
+  function fireKeyup(code, key){
+    [window, document].forEach(function(t){
+      try { t.dispatchEvent(new KeyboardEvent('keyup', {key:key, code:code, bubbles:true})); } catch(e){}
+    });
+  }
+  function open(){
+    if (paused) return;
+    for (var c in held) fireKeyup(c, held[c]);
+    held = {};
+    pausedAt = realNow(); paused = true;
+    ctxs.forEach(function(c){ if (c.state === 'running') { c.__escSusp = true; c.suspend(); } });
+    if (!box) build();
+    (document.body || document.documentElement).appendChild(box);
+    keepBtn.focus();
+  }
+  function close(){
+    if (!paused) return;
+    offset += realNow() - pausedAt; paused = false;
+    if (box && box.parentNode) box.parentNode.removeChild(box);
+    ctxs.forEach(function(c){ if (c.__escSusp) { c.__escSusp = false; c.resume(); } });
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    try { window.focus(); } catch(e){}
+  }
+  function leave(){ location.href = '../'; }
+  function onKey(e){
+    if (e.key === 'Escape' || e.code === 'Escape') {
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (e.type === 'keydown' && !e.repeat) { paused ? close() : open(); }
+      return;
+    }
+    if (paused) {
+      var k = e.key;
+      if (e.type === 'keydown' && (k === 'Tab' || k === 'Enter' || k === ' ' || k.indexOf('Arrow') === 0)) {
+        var bs = box.querySelectorAll('button');
+        if (k.indexOf('Arrow') === 0 || k === 'Tab') {
+          e.preventDefault();
+          (document.activeElement === bs[0] ? bs[1] : bs[0]).focus();
+        } else if (document.activeElement && document.activeElement.click && box.contains(document.activeElement)) {
+          e.preventDefault(); document.activeElement.click();
+        }
+      }
+      e.stopImmediatePropagation();
+      return;
+    }
+    if (e.isTrusted) {
+      if (e.type === 'keydown') held[e.code] = e.key; else delete held[e.code];
+    }
+  }
+  window.addEventListener('keydown', onKey, true);
+  window.addEventListener('keyup', onKey, true);
+  window.addEventListener('keypress', function(e){ if (paused || e.key === 'Escape') e.stopImmediatePropagation(); }, true);
+})();
+</script><script id="arcade-presence">(function(){
+  if (window.__arcadePresence) return; window.__arcadePresence = {};
+  var pid;
+  try { pid = localStorage.getItem('arcade_pid'); } catch(e){}
+  if (!pid || !/^[a-z0-9]{8,32}$/.test(pid)) {
+    pid = ''; while (pid.length < 16) pid += Math.random().toString(36).slice(2);
+    pid = pid.slice(0, 16);
+    try { localStorage.setItem('arcade_pid', pid); } catch(e){}
+  }
+  var home = !!document.querySelector && location.pathname.replace(/index\.html$/,'') === '/';
+  var every = home ? 30000 : 60000, last = 0;
+  function beat(){
+    if (document.hidden) return;
+    last = Date.now();
+    try {
+      fetch('/api/presence', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({pid:pid}), keepalive:true})
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){ if (d && typeof d.now === 'number') { window.__arcadePresence = d; try { window.dispatchEvent(new CustomEvent('arcade-presence', {detail:d})); } catch(e){} } })
+        .catch(function(){});
+    } catch(e){}
+  }
+  setInterval(beat, every);
+  document.addEventListener('visibilitychange', function(){ if (!document.hidden && Date.now() - last > 15000) beat(); });
+  beat();
+})();
+</script>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Hushline</title>
 <style>

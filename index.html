@@ -2,6 +2,32 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<script id="arcade-presence">(function(){
+  if (window.__arcadePresence) return; window.__arcadePresence = {};
+  var pid;
+  try { pid = localStorage.getItem('arcade_pid'); } catch(e){}
+  if (!pid || !/^[a-z0-9]{8,32}$/.test(pid)) {
+    pid = ''; while (pid.length < 16) pid += Math.random().toString(36).slice(2);
+    pid = pid.slice(0, 16);
+    try { localStorage.setItem('arcade_pid', pid); } catch(e){}
+  }
+  var home = !!document.querySelector && location.pathname.replace(/index\.html$/,'') === '/';
+  var every = home ? 30000 : 60000, last = 0;
+  function beat(){
+    if (document.hidden) return;
+    last = Date.now();
+    try {
+      fetch('/api/presence', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({pid:pid}), keepalive:true})
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(d){ if (d && typeof d.now === 'number') { window.__arcadePresence = d; try { window.dispatchEvent(new CustomEvent('arcade-presence', {detail:d})); } catch(e){} } })
+        .catch(function(){});
+    } catch(e){}
+  }
+  setInterval(beat, every);
+  document.addEventListener('visibilitychange', function(){ if (!document.hidden && Date.now() - last > 15000) beat(); });
+  beat();
+})();
+</script>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>The Arcade</title>
 <meta name="description" content="24 free browser games. No downloads, no sign-up. Click and play.">
@@ -20,7 +46,7 @@ body{min-height:100vh;background:
   radial-gradient(900px 400px at 100% 0%,#10304a 0%,transparent 55%),var(--bg)}
 a{color:inherit}
 .wrap{max-width:1240px;margin:0 auto;padding:0 16px}
-header{padding:40px 0 18px}
+header{padding:18px 0 18px}
 h1{font-family:"Bungee",Impact,sans-serif;font-weight:400;margin:0;font-size:clamp(38px,7vw,72px);line-height:1;letter-spacing:1px;
   background:linear-gradient(90deg,var(--sun),var(--hot) 55%,#b46bff);-webkit-background-clip:text;background-clip:text;color:transparent}
 .tag{color:var(--dim);font-size:17px;margin:10px 0 0}
@@ -51,14 +77,29 @@ h2 small{font-family:"Chakra Petch",sans-serif;color:var(--dim);font-size:14px;m
 .desc{color:var(--dim);font-size:15px;line-height:1.4;margin:6px 0 0}
 .empty{color:var(--dim);padding:30px 0}
 footer{color:var(--dim);font-size:14px;padding:40px 0 30px;text-align:center}
+.soon{display:inline-flex;align-items:center;gap:8px;margin:14px 0 0;padding:8px 14px;border:1px dashed var(--sun);border-radius:999px;color:var(--sun);font-weight:700;font-size:15px;letter-spacing:.5px}
+.soon::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--sun);box-shadow:0 0 10px var(--sun)}
+.soon-end{margin:56px 0 0;padding:56px 20px;text-align:center;border:2px dashed var(--sun);border-radius:20px;background:radial-gradient(600px 200px at 50% 0%,#3a2a10 0%,transparent 70%),var(--bg2)}
+.soon-big{font-family:"Bungee",Impact,sans-serif;font-size:clamp(30px,6vw,60px);line-height:1.1;margin:0;color:var(--sun);text-shadow:0 0 24px #ffd23f55;text-wrap:balance}
+.soon-sub{color:var(--dim);font-size:18px;margin:14px 0 0}
+.ctl{position:absolute;top:8px;right:8px;background:#000a;color:var(--mint);font-weight:700;font-size:12px;padding:3px 8px;border-radius:6px;border:1px solid var(--mint)}
+.live{display:inline-flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 18px;padding:7px 14px 7px 12px;background:var(--bg2);border:1px solid var(--line);border-radius:999px;font-size:14px;font-weight:600;color:var(--dim)}
+.live b{color:var(--text);font-size:16px;font-variant-numeric:tabular-nums}
+.live .dot{width:9px;height:9px;border-radius:50%;background:var(--mint);box-shadow:0 0 0 0 #7bf1a880;animation:pulse 2s infinite}
+.live .sep{width:1px;height:16px;background:var(--line)}
+.live[hidden]{display:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 #7bf1a899}70%{box-shadow:0 0 0 8px #7bf1a800}100%{box-shadow:0 0 0 0 #7bf1a800}}
+@media (prefers-reduced-motion:reduce){.live .dot{animation:none}}
 @media (max-width:560px){.grid{grid-template-columns:1fr 1fr;gap:12px}.desc{display:none}.title{font-size:15px}.body{padding:9px 10px 11px}.genre{font-size:11px}}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
+    <div class="live" id="live" hidden aria-live="polite"><span class="dot" aria-hidden="true"></span><span><b id="liveNow">0</b> playing now</span><span class="sep" aria-hidden="true"></span><span><b id="liveAvg">0</b> on average (last 24h)</span></div>
     <h1>The Arcade</h1>
-    <p class="tag">24 free games that run right in your browser. Pick one and play. Your progress saves on this device.</p>
+    <p class="tag">24 free games that run right in your browser. Pick one and play. Your progress saves on this device. Press Esc in any game to pause or leave.</p>
+    <p class="soon">More games coming soon!</p>
   </header>
   <div class="bar">
     <input class="search" id="q" type="search" placeholder="Search games" aria-label="Search games">
@@ -73,12 +114,13 @@ footer{color:var(--dim);font-size:14px;padding:40px 0 30px;text-align:center}
     <div class="grid" id="grid"></div>
     <p class="empty" id="empty" hidden>No games match that search.</p>
   </section>
-  <footer>Works best with a keyboard on a computer. Many games also have touch controls.</footer>
+  <div class="soon-end"><p class="soon-big">More games coming soon!</p><p class="soon-sub">New games are on the way. Check back soon.</p></div>
+  <footer>Works best with a keyboard on a computer. Many games also have touch controls, and the Controller games work with a gamepad.</footer>
 </div>
 <script>
 const GAMES=[
-  {id:'forest-blade',t:'Forest Blade',g:'Adventure',d:'Pixel-art sword adventure. Help the old wizard drive the demons out of the forest.',n:1},
-  {id:'skyrift-brawl',t:'Skyrift Brawl',g:'Fighting',d:'20 fighters on 20 floating arenas. Knock rivals off the edge, solo, with a friend or online.',n:1},
+  {id:'forest-blade',t:'Forest Blade',g:'Adventure',d:'Pixel-art sword adventure. Help the old wizard drive the demons out of the forest.',n:1,c:1},
+  {id:'skyrift-brawl',t:'Skyrift Brawl',g:'Fighting',d:'20 fighters on 20 floating arenas. Knock rivals off the edge, solo, with a friend or online.',n:1,c:1},
   {id:'nova-sentinel',t:'Nova Sentinel',g:'Shooter',d:'Hold the line against the invasion. Grab stars for multi-shot and beat both bosses.',n:1},
   {id:'getaway-grid',t:'Getaway Grid',g:'Driving',d:'Endless city, endless sirens. Steal cars, bank cash and stay out of the cuffs.',n:1},
   {id:'torque-crush',t:'Torque Crush',g:'Driving',d:'Monster truck on bouncy suspension. Crush robots and land flips for nitro.'},
@@ -103,16 +145,17 @@ const GAMES=[
   {id:'caromancer',t:'Caromancer',g:'Shooter',d:'Bank your shots. Every ricochet doubles the damage.'}
 ];
 const $=id=>document.getElementById(id);
-const genres=['All',...[...new Set(GAMES.map(x=>x.g))].sort()];
+const CTL='Controller games';
+const genres=['All',CTL,...[...new Set(GAMES.map(x=>x.g))].sort()];
 let genre='All';
 function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null;}}
 function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function card(x){return `<a class="card" href="./${x.id}/" data-id="${x.id}">
-  <div class="thumb"><img src="thumbs/${x.id}.jpg" alt="" loading="lazy" width="640" height="360">${x.n?'<span class="badge">NEW</span>':''}<div class="play"><span>PLAY</span></div></div>
+  <div class="thumb"><img src="thumbs/${x.id}.jpg" alt="" loading="lazy" width="640" height="360">${x.n?'<span class="badge">NEW</span>':''}${x.c?'<span class="ctl">CONTROLLER</span>':''}<div class="play"><span>PLAY</span></div></div>
   <div class="body"><div class="genre">${esc(x.g)}</div><p class="title">${esc(x.t)}</p><p class="desc">${esc(x.d)}</p></div></a>`;}
 function render(){
   const q=$('q').value.trim().toLowerCase();
-  const list=GAMES.filter(x=>(genre==='All'||x.g===genre)&&(!q||(x.t+' '+x.g+' '+x.d).toLowerCase().includes(q)));
+  const list=GAMES.filter(x=>(genre==='All'||x.g===genre||(genre===CTL&&x.c))&&(!q||(x.t+' '+x.g+' '+x.d).toLowerCase().includes(q)));
   $('grid').innerHTML=list.map(card).join('');
   $('empty').hidden=list.length>0;
   $('allHead').innerHTML=(genre==='All'?'All games':esc(genre))+` <small>${list.length}</small>`;
@@ -121,7 +164,7 @@ function render(){
   $('recentSec').hidden=!rec.length||!!q||genre!=='All';
   $('recent').innerHTML=rec.map(card).join('');
 }
-$('chips').innerHTML=genres.map(g=>`<button class="chip" aria-pressed="${g==='All'}" data-g="${g}">${g}</button>`).join('');
+$('chips').innerHTML=genres.map(g=>`<button class="chip" aria-pressed="${g==='All'}" data-g="${g}">${g===CTL?'🎮 '+g:g}</button>`).join('');
 $('chips').addEventListener('click',e=>{const b=e.target.closest('.chip');if(!b)return;genre=b.dataset.g;
   document.querySelectorAll('.chip').forEach(c=>c.setAttribute('aria-pressed',c===b));render();});
 $('q').addEventListener('input',render);
@@ -130,6 +173,14 @@ document.addEventListener('click',e=>{const a=e.target.closest('.card');if(!a)re
   rec=[a.dataset.id,...rec.filter(i=>i!==a.dataset.id)].slice(0,8);store('arcade_recent',JSON.stringify(rec));});
 window.addEventListener('pageshow',render);
 render();
+</script>
+<script>
+(function(){
+  var el=document.getElementById('live');
+  function show(d){ if(!d||typeof d.now!=='number')return; document.getElementById('liveNow').textContent=d.now; document.getElementById('liveAvg').textContent=(+d.avg).toFixed(1); el.hidden=false; }
+  window.addEventListener('arcade-presence',function(e){show(e.detail)});
+  show(window.__arcadePresence);
+})();
 </script>
 </body>
 </html>
