@@ -146,7 +146,8 @@ const GAMES=[
 ];
 const $=id=>document.getElementById(id);
 const CTL='Controller games';
-const genres=['All',CTL,...[...new Set(GAMES.map(x=>x.g))].sort()];
+const NEW='New games';
+const genres=['All',NEW,CTL,...[...new Set(GAMES.map(x=>x.g))].sort()];
 let genre='All';
 function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null;}}
 function esc(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
@@ -155,7 +156,7 @@ function card(x){return `<a class="card" href="./${x.id}/" data-id="${x.id}">
   <div class="body"><div class="genre">${esc(x.g)}</div><p class="title">${esc(x.t)}</p><p class="desc">${esc(x.d)}</p></div></a>`;}
 function render(){
   const q=$('q').value.trim().toLowerCase();
-  const list=GAMES.filter(x=>(genre==='All'||x.g===genre||(genre===CTL&&x.c))&&(!q||(x.t+' '+x.g+' '+x.d).toLowerCase().includes(q)));
+  const list=GAMES.filter(x=>(genre==='All'||x.g===genre||(genre===CTL&&x.c)||(genre===NEW&&x.n))&&(!q||(x.t+' '+x.g+' '+x.d).toLowerCase().includes(q)));
   $('grid').innerHTML=list.map(card).join('');
   $('empty').hidden=list.length>0;
   $('allHead').innerHTML=(genre==='All'?'All games':esc(genre))+` <small>${list.length}</small>`;
@@ -164,7 +165,7 @@ function render(){
   $('recentSec').hidden=!rec.length||!!q||genre!=='All';
   $('recent').innerHTML=rec.map(card).join('');
 }
-$('chips').innerHTML=genres.map(g=>`<button class="chip" aria-pressed="${g==='All'}" data-g="${g}">${g===CTL?'🎮 '+g:g}</button>`).join('');
+$('chips').innerHTML=genres.map(g=>`<button class="chip" aria-pressed="${g==='All'}" data-g="${g}">${g===CTL?'🎮 '+g:g===NEW?'✨ '+g:g}</button>`).join('');
 $('chips').addEventListener('click',e=>{const b=e.target.closest('.chip');if(!b)return;genre=b.dataset.g;
   document.querySelectorAll('.chip').forEach(c=>c.setAttribute('aria-pressed',c===b));render();});
 $('q').addEventListener('input',render);
